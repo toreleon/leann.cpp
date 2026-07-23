@@ -73,6 +73,7 @@ struct IndexStats {
     std::uint64_t serialized_bytes = 0;
     std::uint64_t dense_vector_bytes_avoided = 0;
     std::string approximation;
+    std::string pair_identity;
     std::string embedder_fingerprint;
 };
 
@@ -88,17 +89,19 @@ class Index {
 
     [[nodiscard]] SearchResponse search(std::string_view query,
                                         Embedder & embedder,
-                                        DocumentStore & documents,
+                                        const DocumentStore & documents,
                                         const SearchConfig & config = {}) const;
     [[nodiscard]] SearchResponse
     search_embedding(std::span<const float> query_embedding,
                      Embedder & embedder,
-                     DocumentStore & documents,
+                     const DocumentStore & documents,
                      const SearchConfig & config = {}) const;
 
     [[nodiscard]] IndexStats stats() const;
     [[nodiscard]] std::size_t size() const noexcept;
     [[nodiscard]] const std::string & embedder_fingerprint() const noexcept;
+    [[nodiscard]] const PairIdentity & pair_identity() const noexcept;
+    void validate_document_store(const DocumentStore & documents) const;
 
   private:
     struct UpperLayer {
@@ -119,6 +122,7 @@ class Index {
     std::uint32_t pq_bits_ = 0;
     std::uint32_t pq_centroids_ = 0;
     std::uint32_t pq_subdimension_ = 0;
+    PairIdentity pair_identity_{};
     std::string embedder_fingerprint_;
     std::vector<std::uint64_t> offsets_;
     std::vector<std::uint32_t> edges_;

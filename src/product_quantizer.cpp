@@ -39,12 +39,17 @@ void pack_code(std::span<std::uint8_t> packed,
 
 float squared_distance(std::span<const float> point,
                        std::span<const float> centroid) {
-    float result = 0.0F;
+    double result = 0.0;
     for (std::size_t i = 0; i < point.size(); ++i) {
-        const float delta = point[i] - centroid[i];
+        const double delta =
+            static_cast<double>(point[i]) - centroid[i];
         result += delta * delta;
     }
-    return result;
+    if (!std::isfinite(result) ||
+        result > std::numeric_limits<float>::max()) {
+        throw std::runtime_error("PQ squared distance is not finite");
+    }
+    return static_cast<float>(result);
 }
 
 } // namespace
@@ -58,6 +63,12 @@ ProductQuantizerView::distance_table(std::span<const float> query) const {
     if (query.size() != dimension) {
         throw std::invalid_argument("PQ query dimension mismatch");
     }
+    if (!std::all_of(query.begin(), query.end(), [](float value) {
+            return std::isfinite(value) && std::abs(value) <= 1.0F;
+        })) {
+        throw std::invalid_argument(
+            "PQ query must contain finite normalized coordinates");
+    }
     std::vector<float> table(
         static_cast<std::size_t>(subquantizers) * centroids, 0.0F);
     for (std::uint32_t sub = 0; sub < subquantizers; ++sub) {
@@ -67,14 +78,28 @@ ProductQuantizerView::distance_table(std::span<const float> query) const {
             const std::size_t codebook_begin =
                 (static_cast<std::size_t>(sub) * centroids + centroid) *
                 subdimension;
-            float negative_dot = 0.0F;
+            double negative_dot = 0.0;
             for (std::uint32_t coordinate = 0; coordinate < subdimension;
                  ++coordinate) {
-                negative_dot -= query[query_begin + coordinate] *
-                                codebook[codebook_begin + coordinate];
+                const float centroid_value =
+                    codebook[codebook_begin + coordinate];
+                if (!std::isfinite(centroid_value) ||
+                    std::abs(centroid_value) > 1.0F) {
+                    throw std::runtime_error(
+                        "PQ codebook contains a non-finite or "
+                        "out-of-range value");
+                }
+                negative_dot -=
+                    static_cast<double>(query[query_begin + coordinate]) *
+                    centroid_value;
+            }
+            if (!std::isfinite(negative_dot) ||
+                negative_dot > std::numeric_limits<float>::max() ||
+                negative_dot < -std::numeric_limits<float>::max()) {
+                throw std::runtime_error("PQ distance table is not finite");
             }
             table[static_cast<std::size_t>(sub) * centroids + centroid] =
-                negative_dot;
+                static_cast<float>(negative_dot);
         }
     }
     return table;
@@ -92,16 +117,27 @@ float ProductQuantizerView::approximate_distance(
     }
     const auto packed =
         std::span<const std::uint8_t>(codes).subspan(node * bytes, bytes);
-    float result = 1.0F;
+    double result = 1.0;
     for (std::uint32_t sub = 0; sub < subquantizers; ++sub) {
         const std::uint32_t code =
             unpack_code(packed, static_cast<std::size_t>(sub) * bits, bits);
         if (code >= centroids) {
             throw std::runtime_error("PQ code references an invalid centroid");
         }
-        result += table[static_cast<std::size_t>(sub) * centroids + code];
+        const float contribution =
+            table[static_cast<std::size_t>(sub) * centroids + code];
+        if (!std::isfinite(contribution)) {
+            throw std::invalid_argument(
+                "PQ distance table contains NaN or infinity");
+        }
+        result += contribution;
     }
-    return result;
+    if (!std::isfinite(result) ||
+        result > std::numeric_limits<float>::max() ||
+        result < -std::numeric_limits<float>::max()) {
+        throw std::runtime_error("PQ approximate distance is not finite");
+    }
+    return static_cast<float>(result);
 }
 
 std::size_t ProductQuantizerModel::bytes_per_vector() const noexcept {
@@ -156,6 +192,13 @@ ProductQuantizerModel train_product_quantizer(
     for (const Embedding & embedding : embeddings) {
         if (embedding.size() != dimension) {
             throw std::invalid_argument("PQ training dimensions differ");
+        }
+        if (!std::all_of(embedding.begin(), embedding.end(), [](float value) {
+                return std::isfinite(value) && std::abs(value) <= 1.0F;
+            })) {
+            throw std::invalid_argument(
+                "PQ training embeddings must contain finite normalized "
+                "coordinates");
         }
     }
 

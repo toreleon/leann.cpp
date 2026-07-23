@@ -251,6 +251,7 @@ std::vector<leann::Embedding> load_embedding_cache(
                     "embedding cache contains NaN or infinity");
             }
         }
+        leann::normalize(embedding);
     }
     if (input.peek() != std::char_traits<char>::eof()) {
         throw std::runtime_error(
@@ -400,6 +401,7 @@ void command_search(const Arguments & args) {
     auto index = leann::Index::load(index_path);
     auto documents =
         leann::DocumentStore::open(leann::documents_file_from_prefix(prefix));
+    index.validate_document_store(documents);
     auto embedder = make_embedder(args);
     const auto response =
         index.search(args.require("--query"), *embedder, documents,
@@ -426,6 +428,7 @@ void command_stats(const Arguments & args) {
     const auto index = leann::Index::load(index_path);
     auto documents =
         leann::DocumentStore::open(leann::documents_file_from_prefix(prefix));
+    index.validate_document_store(documents);
     const auto stats = index.stats();
     const double overhead =
         documents.raw_bytes() == 0
@@ -452,6 +455,7 @@ void command_stats(const Arguments & args) {
               << std::setprecision(3) << overhead << '\n'
               << "dense_vector_bytes_avoided="
               << stats.dense_vector_bytes_avoided << '\n'
+              << "pair_identity=" << stats.pair_identity << '\n'
               << "embedder=" << stats.embedder_fingerprint << '\n';
 }
 
@@ -487,6 +491,7 @@ void command_bench(const Arguments & args) {
     auto index = leann::Index::load(leann::index_file_from_prefix(prefix));
     auto documents =
         leann::DocumentStore::open(leann::documents_file_from_prefix(prefix));
+    index.validate_document_store(documents);
     auto embedder = make_embedder(args);
     auto queries = read_lines(args.require("--queries"));
     if (queries.empty()) {
@@ -604,6 +609,11 @@ void command_bench(const Arguments & args) {
     for (const std::string & query : queries) {
         const std::array<std::string, 1> query_batch{query};
         auto embedded_query = embedder->embed(query_batch);
+        if (embedded_query.size() != 1 ||
+            embedded_query.front().size() != embedder->dimension()) {
+            throw std::runtime_error(
+                "embedder returned an invalid benchmark query batch");
+        }
         leann::normalize(embedded_query.front());
         const auto truth =
             exact_top_k(embedded_query.front(), corpus, config.top_k);

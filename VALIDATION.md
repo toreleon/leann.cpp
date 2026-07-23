@@ -1,8 +1,60 @@
 # Validation record
 
-This file records validation of the `v0.2-spike`. Results are implementation
-measurements on one public corpus and one machine, not a reproduction of every
-LEANN paper result.
+This file records validation of the measured `v0.2-spike` and the subsequent
+`v0.3` artifact-integrity hardening. Results are implementation measurements
+on one public corpus and one machine, not a reproduction of every LEANN paper
+result.
+
+## v0.3 artifact integrity gate
+
+The machine-runnable clean-build command is:
+
+```bash
+make HNSWLIB_DIR=/path/to/hnswlib \
+  BUILD_DIR=/new/empty/build-directory \
+  test persistence-test core-safety-test
+```
+
+Validated on Apple arm64 with AppleClang 21:
+
+- Existing PQ, SimHash, compact upper-layer, search, fingerprint-mismatch, and
+  truncation tests: pass.
+- SHA-256 known-answer vectors for empty input and `abc`: pass.
+- CRC32C `123456789` known-answer vector: pass.
+- Valid `.leann` v3 / `.docs` v2 round trip and nonzero shared identity: pass.
+- Both directions of a same-count, same-byte-length cross-pair swap are
+  rejected before the counting embedder is invoked: pass.
+- Index payload/footer corruption, truncation, and appended bytes: rejected.
+- Document fixed-header and metadata corruption: rejected during open before
+  trusting the affected count/table.
+- Lazy document payload corruption: rejected by CRC32C during chunk read.
+- Document truncation and appended bytes: rejected.
+- Hostile `UINT64_MAX` metadata count: rejected without allocation.
+- An injected embedding failure during replacement preserves both previous
+  artifacts byte-for-byte and removes owned temporary files/locks: pass.
+- Fault injection at index backup, document backup, document activation, and
+  final index activation restores the previous pair byte-for-byte: pass.
+- Publication from both-artifact, index-only, document-only, and empty prior
+  states installs one complete new pair and removes owned backups: pass.
+- Injected backup/lock cleanup failures report a distinct “pair committed;
+  cleanup required” state while retaining the recoverable path: pass.
+- A pre-existing build lock blocks a second build without deleting that lock:
+  pass.
+- Two simultaneous same-prefix builders are serialized by the lock; the
+  losing builder fails before embedding and the winning pair validates: pass.
+- NaN and both infinities in build/search ratios, text-query embeddings, raw
+  query vectors, build embeddings, and rerank embeddings: rejected before the
+  unsafe operation.
+- Twelve synchronized workers sharing one const document store completed 300
+  mixed `read` / `read_many` rounds each with exact byte equality: pass.
+- Concurrent-read locking preserves lazy CRC32C rejection and move-only
+  document-store use: pass.
+- The core and persistence suites pass under combined ASan + UBSan.
+
+The validation used a new temporary build directory, compiled with
+`-Wall -Wextra -Wpedantic -Werror`, and exited 0. It does not prove
+fsync/power-loss recovery or that an arbitrary caller-provided embedder is
+thread-safe.
 
 ## Build and correctness
 

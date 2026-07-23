@@ -1,5 +1,20 @@
 # Roadmap from spike to repository-grade system
 
+## Completed in v0.3 integrity hardening
+
+- Versioned corpus identity in both artifacts with pre-embedding pair
+  validation.
+- Full compact-index SHA-256, bounded document-metadata SHA-256, and lazy
+  per-chunk CRC32C.
+- Unique temporary/backup artifacts, same-prefix build locks, index-last
+  fail-closed publication, rollback, and dedicated persistence tests.
+- Explicit migration and power-loss boundaries for the `.leann` v3 and
+  `.docs` v2 formats.
+- Fail-fast finite-value validation across build, query, PQ, and exact-ranking
+  boundaries.
+- Const, synchronized shared document reads with deterministic concurrency and
+  sanitizer coverage.
+
 ## Completed in v0.2 spike
 
 - Native GGUF recomputation, versioned index/document formats, fingerprint
@@ -41,7 +56,7 @@ the same recall and storage budget.
   enforcement, and connectivity checks.
 - Replace 64-bit-per-node-per-offset CSR overhead with blocked or compressed
   adjacency.
-- Add mmap-based immutable index loading and checksums.
+- Add mmap-based immutable index loading.
 
 Exit gate: graph pruning beats uniform degree reduction across at least two
 corpora.
@@ -62,6 +77,7 @@ dataset too large for dense in-memory construction.
 - Add a bounded hot embedding cache.
 - Expose a small C API and a llama.cpp-compatible retrieval example.
 - Add cancellation, progress, structured JSON output, and service mode.
+- Add stale-lock/backup inspection and recovery commands.
 - Package reproducible releases for macOS arm64 and Linux x86_64.
 
 Exit gate: end-to-end local RAG demo survives restart/update, reports its

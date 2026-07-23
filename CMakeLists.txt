@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(leann_cpp VERSION 0.2.0 LANGUAGES C CXX)
+project(leann_cpp VERSION 0.3.0 LANGUAGES C CXX)
 
 include(FetchContent)
 include(GNUInstallDirs)
@@ -23,6 +23,8 @@ else()
 endif()
 
 add_library(leann_cpp
+    src/artifact_publisher.cpp
+    src/checksum.cpp
     src/document_store.cpp
     src/embedder.cpp
     src/index.cpp
@@ -86,6 +88,16 @@ if(LEANN_BUILD_TESTS)
     add_executable(leann_tests tests/test_index.cpp)
     target_link_libraries(leann_tests PRIVATE leann::leann)
     add_test(NAME leann_tests COMMAND leann_tests)
+
+    add_executable(leann_persistence_tests tests/test_persistence.cpp)
+    target_include_directories(
+        leann_persistence_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(leann_persistence_tests PRIVATE leann::leann)
+    add_test(NAME leann_persistence_tests COMMAND leann_persistence_tests)
+
+    add_executable(leann_core_safety_tests tests/test_core_safety.cpp)
+    target_link_libraries(leann_core_safety_tests PRIVATE leann::leann)
+    add_test(NAME leann_core_safety_tests COMMAND leann_core_safety_tests)
 endif()
 
 if(LEANN_ENABLE_LLAMA)

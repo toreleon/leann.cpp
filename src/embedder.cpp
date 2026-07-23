@@ -4,6 +4,7 @@
 #include <bit>
 #include <cmath>
 #include <cctype>
+#include <limits>
 #include <stdexcept>
 
 namespace leann {
@@ -102,14 +103,31 @@ HashEmbedder::embed(std::span<const std::string> texts) {
 void normalize(Embedding & embedding) {
     double squared_norm = 0.0;
     for (const float value : embedding) {
+        if (!std::isfinite(value)) {
+            throw std::invalid_argument(
+                "embedding contains NaN or infinity");
+        }
         squared_norm += static_cast<double>(value) * value;
+    }
+    if (!std::isfinite(squared_norm)) {
+        throw std::runtime_error("embedding norm is not finite");
     }
     if (squared_norm <= 0.0) {
         throw std::runtime_error("embedding has zero norm");
     }
-    const float scale = static_cast<float>(1.0 / std::sqrt(squared_norm));
+    const double scale = 1.0 / std::sqrt(squared_norm);
+    if (!std::isfinite(scale)) {
+        throw std::runtime_error("embedding normalization scale is not finite");
+    }
     for (float & value : embedding) {
-        value *= scale;
+        const double normalized = static_cast<double>(value) * scale;
+        if (!std::isfinite(normalized) ||
+            normalized > std::numeric_limits<float>::max() ||
+            normalized < -std::numeric_limits<float>::max()) {
+            throw std::runtime_error(
+                "normalized embedding contains NaN or infinity");
+        }
+        value = static_cast<float>(normalized);
     }
 }
 
@@ -119,9 +137,19 @@ float cosine_distance(std::span<const float> lhs, std::span<const float> rhs) {
     }
     double dot = 0.0;
     for (std::size_t i = 0; i < lhs.size(); ++i) {
+        if (!std::isfinite(lhs[i]) || !std::isfinite(rhs[i])) {
+            throw std::invalid_argument(
+                "cosine distance input contains NaN or infinity");
+        }
         dot += static_cast<double>(lhs[i]) * rhs[i];
     }
-    return 1.0F - static_cast<float>(dot);
+    const double distance = 1.0 - dot;
+    if (!std::isfinite(distance) ||
+        distance > std::numeric_limits<float>::max() ||
+        distance < -std::numeric_limits<float>::max()) {
+        throw std::runtime_error("cosine distance is not finite");
+    }
+    return static_cast<float>(distance);
 }
 
 } // namespace leann
