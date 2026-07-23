@@ -1,0 +1,72 @@
+{
+  "dataset": {
+    "name": "BEIR SciFact",
+    "source_url": "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip",
+    "archive_sha256": "536e14446a0ba56ed1398ab1055f39fe852686ecad24a6306c80c490fa8e0165",
+    "documents": 5183,
+    "test_queries": 300,
+    "raw_document_bytes_without_newlines": 7782636
+  },
+  "environment": {
+    "machine": "Apple M4 Pro, 14 cores, 48 GB RAM",
+    "os": "macOS 26.5.1",
+    "backend": "llama.cpp/ggml Metal",
+    "llama_cpp_revision": "c588c4f47683e73ad2d69f50480bec6cc85fd0f7",
+    "hnswlib_revision": "d9b3608c83d83b46c96e25088cb1d729b29dcfe9",
+    "model": "nomic-embed-text-v1.5.Q4_K_M.gguf",
+    "model_sha256": "d4e388894e09cf3816e8b0896d81d265b55e7a9fff9ab03fe8bf4ef5e11295ac",
+    "dimension": 768,
+    "gpu_layers": 99
+  },
+  "index": {
+    "approximation": "pq",
+    "pq_subquantizers": 64,
+    "pq_bits": 4,
+    "pq_training_iterations": 10,
+    "pq_training_samples": 4096,
+    "graph_degree": 16,
+    "ef_construction": 100,
+    "low_degree": 3,
+    "hub_ratio": 0.02,
+    "base_directed_edges": 27667,
+    "upper_directed_edges": 3575,
+    "bytes": 385975,
+    "sha256": "5d2f7f5081f723f75464e6381ba9492055f54c29bbf12eead1d9435bd534c5fd",
+    "raw_percent": 4.959437907670358,
+    "dense_fp32_bytes_omitted": 15922176,
+    "build_seconds": 115.001,
+    "build_maximum_rss_bytes": 1607237632
+  },
+  "search": {
+    "top_k": 3,
+    "ef_search": 64,
+    "recompute_batch": 16,
+    "rerank_ratio": 0.25,
+    "approximate_scan_limit": 100000,
+    "recall_definition": "overlap with exact dense top-3 under the same normalized Nomic embeddings",
+    "recall_at_3": 0.924444,
+    "latency_ms_mean": 1273.827155,
+    "latency_ms_p50": 1196.477417,
+    "latency_ms_p95": 1750.225584,
+    "exact_recomputations_mean": 64.0,
+    "approximate_distances_mean": 5238.94,
+    "upper_layer_hops_mean": 3.29
+  },
+  "dense_hnsw_baseline": {
+    "m": 16,
+    "ef_construction": 100,
+    "ef_search": 64,
+    "recall_at_3": 0.996667,
+    "latency_ms_mean": 0.394975,
+    "latency_ms_p50": 0.390417,
+    "latency_ms_p95": 0.473583,
+    "index_bytes": 16713632,
+    "dense_over_compact_ratio": 43.30236932443811
+  },
+  "notes": [
+    "Recall is embedding-neighbor recall, not qrels-based BEIR task recall.",
+    "Both search latencies exclude query embedding.",
+    "Compact latency includes document reads, GGUF recomputation, ADC, and exact reranking.",
+    "Dense HNSW latency measures resident-vector graph search."
+  ]
+}

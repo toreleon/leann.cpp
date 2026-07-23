@@ -1,0 +1,30 @@
+LEANN saves vector-index storage by recomputing selected embeddings during retrieval.
+HNSW is a proximity graph for approximate nearest-neighbor search.
+llama.cpp runs GGUF language and embedding models locally through ggml backends.
+A compact CSR graph stores offsets followed by contiguous neighbor identifiers.
+Product quantization approximates vectors with short learned codes.
+Retrieval-augmented generation supplies relevant passages to a language model.
+Local RAG keeps private documents on the user's own machine.
+Dense FP32 embeddings require four bytes for every vector dimension.
+Graph hubs are high-degree nodes that help search navigate between regions.
+Dynamic batching improves accelerator utilization during embedding recomputation.
+Cosine similarity compares the angle between normalized embedding vectors.
+Recall at k measures how many exact nearest neighbors an approximate search finds.
+SimHash uses random hyperplanes to produce compact binary similarity sketches.
+Metal accelerates ggml model execution on Apple silicon.
+CUDA accelerates numerical workloads on supported NVIDIA GPUs.
+An immutable index can be memory mapped and shared by concurrent readers.
+Sharded construction limits peak memory and temporary disk consumption.
+Soft deletion preserves graph connectivity while hiding inactive documents.
+An embedding cache trades a small amount of storage for lower repeated-query latency.
+Chunking divides long documents into passages suitable for retrieval.
+The build stage may use dense vectors temporarily and discard them afterward.
+Exact reranking restores ranking quality after approximate candidate filtering.
+Index fingerprints prevent accidental use of a different embedding model.
+Benchmark ground truth comes from a brute-force scan over all dense embeddings.
+Search latency should report both median and tail percentiles.
+Storage measurements should separate raw documents, graph metadata, and vector codes.
+Aggressive graph pruning reduces bytes but can damage connectivity and recall.
+The entry point determines where a graph traversal begins.
+A larger search budget recomputes more embeddings and usually improves recall.
+The first spike should measure recall, latency, storage, and peak memory together.

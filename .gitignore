@@ -1,0 +1,12 @@
+/build*/
+/out/
+/*.leann
+/*.docs
+*.dSYM/
+__pycache__/
+*.pyc
+.DS_Store
+/outputs/*.tar.gz
+
+# Local research material is not part of the repository.
+/work/

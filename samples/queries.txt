@@ -1,0 +1,8 @@
+How does LEANN reduce vector index storage?
+Why are graph hub nodes useful during search?
+What does dynamic embedding batching improve?
+How should approximate retrieval quality be measured?
+Which local backend accelerates models on Apple silicon?
+Why validate an embedding model fingerprint?
+What is the trade-off of aggressive graph pruning?
+How is exact benchmark ground truth computed?

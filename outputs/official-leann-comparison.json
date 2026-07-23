@@ -1,0 +1,147 @@
+{
+  "schema": "leann.cpp-official-leann-comparison-v1",
+  "created_at": "2026-07-23",
+  "dataset": {
+    "name": "BEIR SciFact",
+    "documents": 5183,
+    "queries": 300,
+    "raw_text_payload_bytes": 7782636
+  },
+  "embedding": {
+    "model": "nomic-embed-text-v1.5.Q4_K_M.gguf",
+    "dimensions": 768,
+    "llama_cpp_revision": "c588c4f47683e73ad2d69f50480bec6cc85fd0f7",
+    "parity_check": {
+      "documents_sampled": 11,
+      "minimum_cosine": 0.9999998211860657,
+      "mean_cosine": 0.9999999403953552,
+      "maximum_absolute_difference": 0.00007321976590901613
+    }
+  },
+  "leann_cpp": {
+    "version": "0.2",
+    "config": {
+      "pq_subquantizers": 64,
+      "pq_bits": 4,
+      "graph_build_degree": 16,
+      "low_degree": 3,
+      "exact_recompute": 64
+    },
+    "storage": {
+      "vector_index_bytes": 385975,
+      "vector_index_raw_percent": 4.959437907670358,
+      "text_store_bytes": 7824128,
+      "total_bytes": 8210103
+    },
+    "search_full_300": {
+      "recall_at_3": 0.924444,
+      "candidate_embeddings_mean": 64.0,
+      "latency_ms": {
+        "mean": 1273.827155,
+        "p50": 1196.477417,
+        "p95": 1750.225584
+      }
+    }
+  },
+  "official_leann": {
+    "repository": "https://github.com/StarTrail-org/LEANN",
+    "commit": "7a34d8856b7aa92da47097af02e8f26b341a90a3",
+    "commit_date": "2026-07-19T00:41:18-05:00",
+    "core_source": "pinned official commit",
+    "backend_hnsw_package": "0.3.7",
+    "config": {
+      "backend": "hnsw",
+      "M": 32,
+      "efConstruction": 200,
+      "is_compact": true,
+      "is_recompute": true,
+      "distance_metric": "cosine",
+      "search_complexity": 8,
+      "search_batch_size": 16
+    },
+    "build": {
+      "seconds_excluding_embedding": 2.8702894170000945,
+      "peak_rss_bytes": 170377216
+    },
+    "storage": {
+      "vector_index_bytes": 635358,
+      "vector_index_raw_percent": 8.163789235421007,
+      "lookup_aux_bytes": 86634,
+      "vector_serving_bytes": 721992,
+      "text_store_bytes": 8066226,
+      "total_bytes": 8788218
+    },
+    "search_full_300_with_exact_cached_candidate_vectors": {
+      "recall_at_3": 0.9277777777777778,
+      "candidate_embeddings_mean": 307.81,
+      "latency_ms": {
+        "mean": 407.3233651333794,
+        "p50": 401.0634164988005,
+        "p95": 523.2026333496834
+      },
+      "latency_scope": "graph, IPC, passage lookup and JSON vector transport; model inference removed"
+    },
+    "search_real_gguf_sample_20": {
+      "query_indices": [
+        0,
+        15,
+        31,
+        47,
+        62,
+        78,
+        94,
+        110,
+        125,
+        141,
+        157,
+        173,
+        188,
+        204,
+        220,
+        236,
+        251,
+        267,
+        283,
+        299
+      ],
+      "candidate_embeddings_mean": 312.75,
+      "latency_ms": {
+        "mean": 6534.278014550728,
+        "p50": 6372.137916499923,
+        "p95": 8642.613568751585,
+        "min": 4739.830416998302,
+        "max": 8921.031375000894
+      },
+      "timing_scope": "official HNSW backend plus real candidate recompute through ZMQ, OpenAI-compatible mode and llama-server; query embedding and cold start excluded"
+    },
+    "additional_full_300_operating_points": [
+      {
+        "complexity": 4,
+        "recall_at_3": 0.8444444444444444,
+        "candidate_embeddings_mean": 238.25666666666666
+      },
+      {
+        "complexity": 16,
+        "recall_at_3": 0.9688888888888889,
+        "candidate_embeddings_mean": 431.77666666666664
+      }
+    ]
+  },
+  "matched_recall_comparison": {
+    "official_minus_leann_cpp_recall": 0.003333777777777769,
+    "official_over_leann_cpp_candidate_embedding_ratio": 4.80953125,
+    "official_over_leann_cpp_mean_real_latency_ratio": 5.1296425805514625,
+    "official_over_leann_cpp_p50_real_latency_ratio": 5.325748589954308,
+    "official_over_leann_cpp_p95_real_latency_ratio": 4.937999791432363,
+    "official_over_leann_cpp_vector_index_ratio": 1.646111794805363,
+    "leann_cpp_vector_index_smaller_percent": 39.25078459703033,
+    "leann_cpp_total_storage_smaller_percent": 6.578296077771395
+  },
+  "caveats": [
+    "Recall and candidate counts are full-set measurements for both systems.",
+    "Official real-GGUF latency uses 20 evenly spaced queries; leann.cpp latency uses all 300.",
+    "Official build time excludes corpus embedding; leann.cpp reported build time is end-to-end and is not directly compared.",
+    "This comparison covers official HNSW, not official DiskANN.",
+    "SciFact is a small 7.78 MB corpus and does not establish million-document scaling."
+  ]
+}

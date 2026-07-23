@@ -1,0 +1,4 @@
+system,configuration,queries,vector_index_bytes,vector_serving_bytes,text_store_bytes,total_bytes,recall_at_3,candidate_embeddings_mean,real_latency_mean_ms,real_latency_p50_ms,real_latency_p95_ms
+leann.cpp v0.2,PQ64x4 low-degree=3 exact=64,300,385975,385975,7824128,8210103,0.924444,64.0,1273.827155,1196.477417,1750.225584
+official LEANN,HNSW M32 efC200 complexity=8 batch=16,300,635358,721992,8066226,8788218,0.9277777778,307.81,,,
+official LEANN real GGUF sample,HNSW M32 efC200 complexity=8 batch=16,20,635358,721992,8066226,8788218,,312.75,6534.278015,6372.137916,8642.613569
