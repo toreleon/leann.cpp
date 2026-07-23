@@ -32,8 +32,9 @@ native serialized format are never placed in the runtime artifact.
    `2 * graph_degree`, retaining the closest links.
 7. Train one k-means codebook per PQ subspace and bit-pack the assigned
    centroid IDs for every vector. SimHash can be selected for ablation.
-8. Persist upper layers + base CSR + approximation data + embedder fingerprint;
-   discard dense vectors.
+8. Derive a deterministic corpus identity from ordered chunk lengths and
+   bytes, persist it in both artifacts, checksum the artifacts, and discard
+   dense vectors.
 
 This approximates the paper's high-degree-preserving idea. The paper rebuilds
 neighbor sets with graph search during pruning; this spike selects from the
@@ -51,7 +52,8 @@ the serialized format.
 3. For `N <= approximate_scan_limit`, scan all compact codes. Otherwise run a
    bounded best-first beam on the pruned base graph from the routed entry.
 4. Keep an approximate shortlist of
-   `ceil(ef_search / rerank_ratio)` candidates.
+   `ceil(ef_search / rerank_ratio)` candidates, saturated at the index size
+   before any floating-point-to-integer conversion.
 5. Fetch and re-embed the best `ef_search` candidates in
    `recompute_batch_size` batches.
 6. Return exact cosine top-k among those recomputed candidates.
@@ -69,8 +71,9 @@ when loaded.
 
 | Field | Type |
 |---|---|
-| magic | 8 bytes, `LEANNC02` |
+| magic | 8 bytes, `LEANNC03` |
 | version, metric | `u32`, `u32` |
+| corpus pair identity | 32-byte SHA-256 |
 | dimension, approximation kind | `u32`, `u32` |
 | maximum degree, entry point, maximum level | `u32` × 3 |
 | sketch bits | `u32` |
@@ -84,6 +87,7 @@ when loaded.
 | each upper-layer CSR | node IDs `u32`, offsets `u64`, edges `u32` |
 | PQ codebook + bit-packed codes | FP32 values + declared bytes |
 | or SimHash table | `N * sketch_bits / 8` bytes |
+| artifact checksum | 32-byte SHA-256 of all preceding bytes |
 
 The format currently uses 64-bit CSR offsets to avoid a 4-billion-edge limit.
 An optional blocked/varint CSR format is a future storage optimization.
@@ -92,19 +96,54 @@ An optional blocked/varint CSR format is a future storage optimization.
 
 | Field | Type |
 |---|---|
-| magic | 8 bytes, `LEANDC01` |
+| magic | 8 bytes, `LEANDC02` |
 | version | `u32` |
+| corpus pair identity | 32-byte SHA-256 |
 | document count | `u64` |
+| fixed-header checksum | 32-byte SHA-256 of preceding header |
 | byte offsets | `(N + 1) * u64` |
+| document checksums | `N * u32` CRC32C |
+| metadata checksum | 32-byte SHA-256 of all preceding metadata |
 | UTF-8 document bytes | variable |
 
-Only requested documents are read. The entire raw corpus is not loaded during
-normal search.
+Only requested documents are read. Open verifies the bounded metadata region;
+each requested document is checked against CRC32C after its bytes are read.
+The entire raw corpus is not loaded or hashed during normal startup.
+The opened stream is protected by an internal mutex, so const `read` and
+`read_many` calls on one store are safe across concurrent workers without
+reopening a pathname that may have been replaced.
+
+## Publication protocol
+
+An index build acquires empty-directory locks adjacent to both target files and
+uses unique same-directory `.tmp.*` and `.bak.*` paths. It closes and validates
+the complete temporary pair before publication. Existing artifacts are moved
+to backups, the new document store is renamed into place, and the new index is
+renamed last as the commit marker. Ordinary errors trigger rollback, restoring
+documents before the index so an old index is never reactivated against the
+wrong chunks.
+
+The shared identity makes racing readers fail closed. A process or machine
+interruption can leave the index absent, backups, or stale locks; C++20 does
+not provide portable directory fsync or a two-file atomic rename. The protocol
+therefore claims transactional rollback for reported filesystem errors and
+torn-pair detection, not power-loss atomic activation.
+
+Checksum verification and parsing use the same already-open stream, so an
+adjacent rename cannot make the loader validate one inode and parse another.
+If the new pair commits but backup or lock removal fails, the builder reports
+an explicit “committed; cleanup required” error and leaves the path available
+for recovery.
 
 ## Invariants
 
 - Corpus node labels are contiguous `u32` IDs.
+- The index and document store have the same nonzero corpus pair identity.
+- The compact index SHA-256, document metadata SHA-256, and every fetched
+  chunk CRC32C validate before affected data is used.
 - Stored embeddings and query embeddings are L2-normalized.
+- Configuration ratios, embeddings, PQ intermediates, and exact distances are
+  finite before conversion, heap insertion, or sorting.
 - Build and search embedder fingerprints must match.
 - Every CSR edge points to an existing node.
 - Every upper edge points to a node present on that layer, and the global
@@ -128,3 +167,9 @@ normal search.
 - Build memory is still `O(N * dimension)`.
 - A model description/size/config fingerprint is a guardrail, not a
   cryptographic model or backend hash.
+- CRC32C detects accidental chunk corruption but is not an authenticity
+  mechanism.
+- Stale-lock/backup recovery after an unclean machine stop is currently
+  manual.
+- Concurrent searches may share `Index` and `DocumentStore`; concurrency of a
+  caller-supplied `Embedder` remains that implementation's responsibility.

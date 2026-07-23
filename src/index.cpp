@@ -1,5 +1,7 @@
 #include "leann/index.hpp"
 
+#include "artifact_publisher.hpp"
+#include "checksum.hpp"
 #include "format.hpp"
 #include "product_quantizer.hpp"
 
@@ -7,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -15,6 +18,7 @@
 #include <limits>
 #include <numeric>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 #include <utility>
@@ -22,8 +26,9 @@
 namespace leann {
 namespace {
 
-constexpr std::array<char, 8> index_magic{'L', 'E', 'A', 'N', 'N', 'C', '0', '2'};
-constexpr std::uint32_t index_version = 2;
+constexpr std::array<char, 8> index_magic{'L', 'E', 'A', 'N',
+                                           'N', 'C', '0', '3'};
+constexpr std::uint32_t index_version = 3;
 constexpr std::uint32_t cosine_metric = 1;
 
 using Clock = std::chrono::steady_clock;
@@ -99,8 +104,10 @@ void validate_build_config(const BuildConfig & config) {
         throw std::invalid_argument(
             "low_degree must be in [1, 2 * graph_degree]");
     }
-    if (config.hub_ratio < 0.0 || config.hub_ratio > 1.0) {
-        throw std::invalid_argument("hub_ratio must be in [0, 1]");
+    if (!std::isfinite(config.hub_ratio) || config.hub_ratio < 0.0 ||
+        config.hub_ratio > 1.0) {
+        throw std::invalid_argument(
+            "hub_ratio must be finite and in [0, 1]");
     }
     if (config.sketch_bits < 64 || config.sketch_bits % 64U != 0U) {
         if (config.approximation == ApproximationKind::SimHash) {
@@ -133,8 +140,10 @@ void validate_search_config(const SearchConfig & config) {
     if (config.recompute_batch_size == 0) {
         throw std::invalid_argument("recompute_batch_size must be positive");
     }
-    if (config.rerank_ratio <= 0.0 || config.rerank_ratio > 1.0) {
-        throw std::invalid_argument("rerank_ratio must be in (0, 1]");
+    if (!std::isfinite(config.rerank_ratio) ||
+        config.rerank_ratio <= 0.0 || config.rerank_ratio > 1.0) {
+        throw std::invalid_argument(
+            "rerank_ratio must be finite and in (0, 1]");
     }
 }
 
@@ -164,8 +173,9 @@ std::vector<float> read_float_vector(std::istream & input, std::size_t count) {
     std::vector<float> values(count);
     for (float & value : values) {
         value = std::bit_cast<float>(detail::read_le<std::uint32_t>(input));
-        if (!std::isfinite(value)) {
-            throw std::runtime_error("PQ codebook contains NaN or infinity");
+        if (!std::isfinite(value) || std::abs(value) > 1.0F) {
+            throw std::runtime_error(
+                "PQ codebook contains a non-finite or out-of-range value");
         }
     }
     return values;
@@ -176,6 +186,136 @@ struct SerializedUpperLayer {
     std::vector<std::uint64_t> offsets;
     std::vector<std::uint32_t> edges;
 };
+
+bool is_zero_identity(const PairIdentity & identity) {
+    return std::all_of(identity.begin(), identity.end(),
+                       [](std::uint8_t byte) { return byte == 0U; });
+}
+
+std::filesystem::path lock_path_for(const std::filesystem::path & target) {
+    auto result = target;
+    result += ".lock";
+    return result;
+}
+
+class BuildLocks {
+  public:
+    BuildLocks(const std::filesystem::path & first,
+               const std::filesystem::path & second) {
+        std::array<std::filesystem::path, 2> targets{first, second};
+        std::sort(targets.begin(), targets.end(),
+                  [](const auto & lhs, const auto & rhs) {
+                      return lhs.string() < rhs.string();
+                  });
+        for (const auto & target : targets) {
+            const auto lock = lock_path_for(target);
+            if (!locks_.empty() && lock == locks_.back()) {
+                continue;
+            }
+            std::error_code error;
+            const bool created = std::filesystem::create_directory(lock, error);
+            if (!created) {
+                release_noexcept();
+                const std::string reason =
+                    error ? error.message()
+                          : "lock already exists (active or stale build)";
+                throw std::runtime_error("cannot acquire build lock '" +
+                                         lock.string() + "': " + reason);
+            }
+            locks_.push_back(lock);
+        }
+    }
+
+    ~BuildLocks() { release_noexcept(); }
+    BuildLocks(const BuildLocks &) = delete;
+    BuildLocks & operator=(const BuildLocks &) = delete;
+
+    void release_checked() {
+        std::string failures;
+        for (auto current = locks_.rbegin(); current != locks_.rend();
+             ++current) {
+            std::error_code error;
+            std::filesystem::remove(*current, error);
+            if (error) {
+                if (!failures.empty()) {
+                    failures += ' ';
+                }
+                failures += "'" + current->string() + "': " +
+                            error.message() + ";";
+            }
+        }
+        locks_.clear();
+        if (!failures.empty()) {
+            throw std::runtime_error(
+                "artifact pair committed; build lock cleanup required: " +
+                failures);
+        }
+    }
+
+  private:
+    void release_noexcept() noexcept {
+        for (auto current = locks_.rbegin(); current != locks_.rend();
+             ++current) {
+            std::error_code ignored;
+            std::filesystem::remove(*current, ignored);
+        }
+        locks_.clear();
+    }
+
+    std::vector<std::filesystem::path> locks_;
+};
+
+std::string unique_token() {
+    static std::atomic<std::uint64_t> sequence{0};
+    const std::uint64_t serial =
+        sequence.fetch_add(1U, std::memory_order_relaxed);
+    const std::uint64_t now = static_cast<std::uint64_t>(
+        Clock::now().time_since_epoch().count());
+    const std::uint64_t first = splitmix64(now ^ serial);
+    const std::uint64_t second =
+        splitmix64(first ^ (serial + 0x6c65616e6e637070ULL));
+    std::ostringstream token;
+    token << std::hex << first << second;
+    return token.str();
+}
+
+std::filesystem::path
+unique_adjacent_path(const std::filesystem::path & target,
+                     std::string_view marker) {
+    for (int attempt = 0; attempt < 32; ++attempt) {
+        auto candidate = target;
+        candidate += std::string(marker) + unique_token();
+        std::error_code error;
+        const bool exists = std::filesystem::exists(candidate, error);
+        if (error) {
+            throw std::runtime_error("cannot inspect temporary path '" +
+                                     candidate.string() + "': " +
+                                     error.message());
+        }
+        if (!exists) {
+            return candidate;
+        }
+    }
+    throw std::runtime_error("cannot allocate a unique artifact path for " +
+                             target.string());
+}
+
+void require_regular_or_missing(const std::filesystem::path & path) {
+    std::error_code error;
+    const bool exists = std::filesystem::exists(path, error);
+    if (error) {
+        throw std::runtime_error("cannot inspect artifact '" + path.string() +
+                                 "': " + error.message());
+    }
+    if (exists && !std::filesystem::is_regular_file(path, error)) {
+        throw std::runtime_error("artifact target is not a regular file: " +
+                                 path.string());
+    }
+    if (error) {
+        throw std::runtime_error("cannot inspect artifact type '" +
+                                 path.string() + "': " + error.message());
+    }
+}
 
 } // namespace
 
@@ -195,29 +335,44 @@ void Index::build(const std::filesystem::path & index_path,
         embedder.dimension() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("invalid embedder dimension");
     }
+    const auto normalized_index =
+        std::filesystem::absolute(index_path).lexically_normal();
+    const auto normalized_documents =
+        std::filesystem::absolute(documents_path).lexically_normal();
+    if (normalized_index == normalized_documents) {
+        throw std::invalid_argument(
+            "index and document store paths must be different");
+    }
 
-    auto temporary_index_path = index_path;
-    temporary_index_path += ".tmp";
-    auto temporary_documents_path = documents_path;
-    temporary_documents_path += ".tmp";
-    std::error_code cleanup_error;
-    std::filesystem::remove(temporary_index_path, cleanup_error);
-    cleanup_error.clear();
-    std::filesystem::remove(temporary_documents_path, cleanup_error);
+    BuildLocks build_locks(normalized_index, normalized_documents);
+    require_regular_or_missing(normalized_index);
+    require_regular_or_missing(normalized_documents);
+    const auto temporary_index_path =
+        unique_adjacent_path(normalized_index, ".tmp.");
+    const auto temporary_documents_path =
+        unique_adjacent_path(normalized_documents, ".tmp.");
+    const auto index_backup =
+        unique_adjacent_path(normalized_index, ".bak.");
+    const auto documents_backup =
+        unique_adjacent_path(normalized_documents, ".bak.");
     struct TemporaryCleanup {
         std::filesystem::path index;
         std::filesystem::path documents;
-        bool committed = false;
         ~TemporaryCleanup() {
-            if (!committed) {
-                std::error_code ignored;
-                std::filesystem::remove(index, ignored);
-                std::filesystem::remove(documents, ignored);
-            }
+            std::error_code ignored;
+            std::filesystem::remove(index, ignored);
+            ignored.clear();
+            std::filesystem::remove(documents, ignored);
         }
     } temporary_cleanup{temporary_index_path, temporary_documents_path};
 
     DocumentStore::write(temporary_documents_path, documents);
+    PairIdentity pair_identity{};
+    {
+        auto candidate_documents =
+            DocumentStore::open(temporary_documents_path);
+        pair_identity = candidate_documents.pair_identity();
+    }
 
     std::vector<Embedding> embeddings;
     embeddings.reserve(documents.size());
@@ -424,6 +579,9 @@ void Index::build(const std::filesystem::path & index_path,
     detail::write_bytes(output, index_magic.data(), index_magic.size());
     detail::write_le<std::uint32_t>(output, index_version);
     detail::write_le<std::uint32_t>(output, cosine_metric);
+    detail::write_bytes(
+        output, reinterpret_cast<const char *>(pair_identity.data()),
+        pair_identity.size());
     detail::write_le<std::uint32_t>(
         output, static_cast<std::uint32_t>(embedder.dimension()));
     detail::write_le<std::uint32_t>(
@@ -472,26 +630,21 @@ void Index::build(const std::filesystem::path & index_path,
         throw std::runtime_error("failed to finalize index: " +
                                  temporary_index_path.string());
     }
+    detail::append_sha256_footer(temporary_index_path);
 
-    // All expensive work has succeeded. Replace the two artifacts only now,
-    // so embedding/build errors leave the previous index untouched.
-    std::error_code replace_error;
-    std::filesystem::remove(documents_path, replace_error);
-    replace_error.clear();
-    std::filesystem::rename(temporary_documents_path, documents_path,
-                            replace_error);
-    if (replace_error) {
-        throw std::runtime_error("failed to publish document store: " +
-                                 replace_error.message());
+    // Validate both complete temporary artifacts before entering the short
+    // publication transaction. The index is renamed last and acts as the
+    // commit marker; readers either see a matching pair or fail closed.
+    {
+        const auto candidate_index = Index::load(temporary_index_path);
+        auto candidate_documents =
+            DocumentStore::open(temporary_documents_path);
+        candidate_index.validate_document_store(candidate_documents);
     }
-    std::filesystem::remove(index_path, replace_error);
-    replace_error.clear();
-    std::filesystem::rename(temporary_index_path, index_path, replace_error);
-    if (replace_error) {
-        throw std::runtime_error("failed to publish index: " +
-                                 replace_error.message());
-    }
-    temporary_cleanup.committed = true;
+    detail::publish_artifact_pair(
+        temporary_index_path, temporary_documents_path, normalized_index,
+        normalized_documents, index_backup, documents_backup);
+    build_locks.release_checked();
 }
 
 Index Index::load(const std::filesystem::path & index_path) {
@@ -510,6 +663,13 @@ Index Index::load(const std::filesystem::path & index_path) {
         throw std::runtime_error("unsupported index version: " +
                                  std::to_string(version));
     }
+    const std::uint64_t checksummed_size =
+        detail::verify_sha256_footer(input, "index");
+    input.seekg(static_cast<std::streamoff>(index_magic.size() +
+                                            sizeof(std::uint32_t)));
+    if (!input) {
+        throw std::runtime_error("cannot seek checksummed index header");
+    }
     const std::uint32_t metric = detail::read_le<std::uint32_t>(input);
     if (metric != cosine_metric) {
         throw std::runtime_error("unsupported index metric");
@@ -517,6 +677,12 @@ Index Index::load(const std::filesystem::path & index_path) {
 
     Index index;
     index.path_ = index_path;
+    detail::read_bytes(
+        input, reinterpret_cast<char *>(index.pair_identity_.data()),
+        index.pair_identity_.size());
+    if (is_zero_identity(index.pair_identity_)) {
+        throw std::runtime_error("index has a zero pair identity");
+    }
     index.dimension_ = detail::read_le<std::uint32_t>(input);
     const std::uint32_t approximation =
         detail::read_le<std::uint32_t>(input);
@@ -552,12 +718,11 @@ Index Index::load(const std::filesystem::path & index_path) {
         throw std::runtime_error("invalid index header");
     }
 
-    const std::uint64_t file_size = std::filesystem::file_size(index_path);
     const auto payload_position = static_cast<std::uint64_t>(input.tellg());
-    if (payload_position > file_size) {
+    if (payload_position > checksummed_size) {
         throw std::runtime_error("invalid index file size");
     }
-    std::uint64_t remaining = file_size - payload_position;
+    std::uint64_t remaining = checksummed_size - payload_position;
     auto consume = [&](std::uint64_t elements, std::uint64_t element_size,
                        const char * field) {
         if (element_size == 0 || elements > remaining / element_size) {
@@ -733,14 +898,26 @@ Index Index::load(const std::filesystem::path & index_path) {
 
 SearchResponse Index::search(std::string_view query,
                              Embedder & embedder,
-                             DocumentStore & documents,
+                             const DocumentStore & documents,
                              const SearchConfig & config) const {
+    validate_document_store(documents);
+    validate_search_config(config);
+    if (embedder.fingerprint() != embedder_fingerprint_) {
+        throw std::invalid_argument(
+            "embedder fingerprint mismatch: index uses '" +
+            embedder_fingerprint_ + "', query uses '" + embedder.fingerprint() +
+            "'");
+    }
+    if (embedder.dimension() != dimension_) {
+        throw std::invalid_argument("query embedding dimension mismatch");
+    }
     std::string owned_query(query);
     const std::array<std::string, 1> queries{std::move(owned_query)};
     auto query_embeddings = embedder.embed(queries);
     if (query_embeddings.size() != 1) {
         throw std::runtime_error("embedder returned the wrong query batch size");
     }
+    validate_embedding(query_embeddings.front(), dimension_);
     normalize(query_embeddings.front());
     return search_embedding(query_embeddings.front(), embedder, documents, config);
 }
@@ -748,8 +925,9 @@ SearchResponse Index::search(std::string_view query,
 SearchResponse
 Index::search_embedding(std::span<const float> query_embedding,
                         Embedder & embedder,
-                        DocumentStore & documents,
+                        const DocumentStore & documents,
                         const SearchConfig & config) const {
+    validate_document_store(documents);
     validate_search_config(config);
     if (embedder.fingerprint() != embedder_fingerprint_) {
         throw std::invalid_argument(
@@ -761,10 +939,11 @@ Index::search_embedding(std::span<const float> query_embedding,
         embedder.dimension() != dimension_) {
         throw std::invalid_argument("query embedding dimension mismatch");
     }
-    if (documents.size() != size()) {
-        throw std::invalid_argument("document store and index node counts differ");
+    if (!std::all_of(query_embedding.begin(), query_embedding.end(),
+                     [](float value) { return std::isfinite(value); })) {
+        throw std::invalid_argument(
+            "query embedding contains NaN or infinity");
     }
-
     Embedding normalized_query(query_embedding.begin(), query_embedding.end());
     normalize(normalized_query);
     const auto start = Clock::now();
@@ -857,12 +1036,14 @@ Index::search_embedding(std::span<const float> query_embedding,
 
     const std::size_t exact_budget =
         std::min<std::size_t>(config.ef_search, size());
-    const std::size_t approximate_beam = std::min<std::size_t>(
-        size(), std::max<std::size_t>(
-                    exact_budget,
-                    static_cast<std::size_t>(std::ceil(
-                        static_cast<double>(exact_budget) /
-                        config.rerank_ratio))));
+    const double requested_beam =
+        static_cast<double>(exact_budget) / config.rerank_ratio;
+    const std::size_t approximate_beam =
+        requested_beam >= static_cast<double>(size())
+            ? size()
+            : std::max<std::size_t>(
+                  exact_budget,
+                  static_cast<std::size_t>(std::ceil(requested_beam)));
     std::vector<std::uint8_t> visited(size(), 0);
     visited[routed_entry] = 1;
     approximate_frontier.push({routed_distance, routed_entry});
@@ -1011,6 +1192,7 @@ IndexStats Index::stats() const {
     result.serialized_bytes = std::filesystem::file_size(path_);
     result.dense_vector_bytes_avoided =
         static_cast<std::uint64_t>(size()) * dimension_ * sizeof(float);
+    result.pair_identity = detail::hex_digest(pair_identity_);
     result.embedder_fingerprint = embedder_fingerprint_;
     return result;
 }
@@ -1021,6 +1203,21 @@ std::size_t Index::size() const noexcept {
 
 const std::string & Index::embedder_fingerprint() const noexcept {
     return embedder_fingerprint_;
+}
+
+const PairIdentity & Index::pair_identity() const noexcept {
+    return pair_identity_;
+}
+
+void Index::validate_document_store(const DocumentStore & documents) const {
+    if (documents.pair_identity() != pair_identity_) {
+        throw std::invalid_argument(
+            "document store and index pair identity mismatch");
+    }
+    if (documents.size() != size()) {
+        throw std::invalid_argument(
+            "document store and index node counts differ");
+    }
 }
 
 std::filesystem::path

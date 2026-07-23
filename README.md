@@ -3,13 +3,14 @@
 `leann.cpp` is a native C++20 spike for low-storage local RAG. It builds an
 HNSW graph with hnswlib, discards the dense vectors, stores a pruned CSR graph
 plus trained product-quantization (PQ) codes, and recomputes promising document
-embeddings in batches with a GGUF model through llama.cpp/ggml.
+embeddings in batches with a GGUF model through a pinned llama.cpp/ggml C API.
 
 This repository is an independent LEANN-style implementation, not an
 accuracy-compatible port of official LEANN. Official LEANN has a Python
 control plane and a custom FAISS C++ data plane; this project targets a
-zero-Python, single-process C++/ggml deployment. The current `v0.2-spike`
-answers the first implementation and measurement questions:
+zero-Python, single-process C++/ggml deployment. The current `v0.3` development
+line adds fail-closed artifact integrity to the measured `v0.2` retrieval
+spike:
 
 > Can a llama.cpp embedding model traverse a compact graph by selectively
 > recomputing document embeddings, and what recall/latency/storage trade-off
@@ -27,7 +28,13 @@ answers the first implementation and measurement questions:
   for small local indexes.
 - Exact llama.cpp recomputation and ranking of only the selected candidates.
 - Batched on-demand recomputation.
-- Model fingerprint validation.
+- A non-cryptographic model/config fingerprint guardrail.
+- SHA-256-protected indexes, lazy per-chunk CRC32C document validation, shared
+  corpus identity, and fail-closed pair publication.
+- Fail-fast rejection of non-finite configuration, query, embedding, PQ, and
+  cosine-distance values before they can enter integer conversions or ranking.
+- Const, mutex-protected document reads so one immutable index/document pair
+  can serve concurrent searches.
 - `build`, `search`, `stats`, and exact-ground-truth `bench` commands, including
   a same-embedding dense HNSW baseline.
 - Reproducible BEIR SciFact preparation and parameter-sweep scripts.
@@ -62,7 +69,8 @@ non-llama path:
 
 ```bash
 make HNSWLIB_DIR=/path/to/hnswlib
-make test HNSWLIB_DIR=/path/to/hnswlib
+make HNSWLIB_DIR=/path/to/hnswlib \
+  test persistence-test core-safety-test
 ```
 
 ## Quick start
@@ -90,9 +98,10 @@ Build and query with one GGUF embedding model:
   --rerank-ratio 0.25
 ```
 
-The same model, pooling metadata, and `--gpu-layers` setting must be used for
-build and search. This avoids silently mixing approximate codes produced on
-different numerical backends.
+The same model description/size, pooling metadata, and `--gpu-layers` setting
+must be used for build and search. This guardrail catches common configuration
+mismatches, but it does not yet cryptographically identify the GGUF weights,
+llama.cpp build, or Metal/CUDA/Vulkan backend.
 `--ctx` is the token capacity per document sequence; `--parallel` sequences
 share a llama.cpp context sized as their product.
 `--pq-subquantizers` must evenly divide the embedding dimension. The default
@@ -211,12 +220,53 @@ scope and caveats.
 
 For prefix `out/demo`, the builder writes:
 
-- `out/demo.leann`: header, embedder fingerprint, pruned CSR graph, compact
-  upper layers, and either PQ metadata/codes/codebook or a SimHash table.
-- `out/demo.docs`: raw chunk store with offsets.
+- `out/demo.leann`: corpus identity, embedder fingerprint, pruned CSR graph,
+  compact upper layers, PQ/SimHash data, and a full-file SHA-256 footer.
+- `out/demo.docs`: corpus identity, offsets, per-chunk CRC32C values, a
+  SHA-256-protected metadata region, and raw chunk bytes.
 
 No FP32 document embedding is written. Run `leann stats --index out/demo` to
 compare index bytes with raw document bytes and the omitted dense-vector size.
+
+### Artifact integrity and format migration
+
+The `.leann` v3 and `.docs` v2 formats deliberately reject older spike
+artifacts; rebuild a v0.2 index from its source chunks. Both new artifacts
+carry the same deterministic 256-bit identity derived from ordered chunk
+lengths and bytes. `search`, `bench`, and `stats` reject a mixed pair before
+query embedding or corpus scanning.
+
+Index loading verifies SHA-256 over the complete compact index. Opening a
+document store verifies only its header, offset table, and checksum table, so a
+100 GB raw corpus is not scanned at startup. Each fetched chunk is checked
+against CRC32C before it is returned for recomputation.
+
+Builders acquire adjacent `.lock` directories, use unique temporary and backup
+names, validate both completed artifacts, publish the document store, and
+rename the index last as the commit marker. An ordinary failure rolls back to
+the previous pair; interruption can leave the index absent or a stale lock,
+but never makes a mixed pair pass validation. C++20 has no portable fsync or
+two-file atomic rename, so this is fail-closed publication rather than a
+power-loss atomicity claim. After a machine-level interruption, stop all
+builders and inspect any `.bak.*` artifacts before removing a stale lock.
+If the new pair commits but backup/lock cleanup fails, `build` reports that
+distinct committed state and retains the recoverable path instead of silently
+claiming cleanup success.
+
+### Concurrency and numeric safety
+
+`Index` is immutable after loading, and `DocumentStore::read` /
+`DocumentStore::read_many` are const and serialize access to their shared file
+stream. Multiple search workers can therefore share one loaded index/document
+pair. Moving or destroying that pair while reads are active is unsupported.
+Each worker must use its own `Embedder`, or an embedder implementation that
+explicitly guarantees concurrent calls; the generic embedder interface does
+not add hidden serialization.
+
+Library validation rejects NaN and infinity in build/search ratios, raw query
+vectors, backend embeddings, PQ calculations, and exact cosine ranking.
+Positive but extremely small rerank ratios saturate the approximate beam at the
+index size instead of converting an infinite intermediate to an integer.
 
 ## Honest spike boundaries
 
@@ -229,7 +279,9 @@ it is still a research spike rather than the paper's complete system:
   reconstruction search;
 - flat ADC is intentionally used below `--scan-limit` (100k nodes by default);
 - a line-oriented document store with no deletes or incremental updates;
-- single-process synchronous serving.
+- no automatic recovery command yet for stale locks/backups after a
+  machine-level interruption;
+- no bundled service mode, cancellation, or request scheduler.
 
 Those differences matter. Do not claim the paper's “under 5%” or recall/latency
 numbers from this code without measuring them on the target corpus and model.
