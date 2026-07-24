@@ -272,6 +272,81 @@ class BenchmarkToolsTest(unittest.TestCase):
             vectors, _ = read_cache(cache)
             self.assertEqual(vectors.shape, (3, 4))
 
+    def test_request_concurrency_produces_identical_cache_bytes(self) -> None:
+        model = {
+            "embedding_model": "fake",
+            "native_fingerprint": "fake-fp",
+            "declared_identity": "test",
+            "artifact": None,
+            "sha256": "b" * 64,
+            "identity_strength": "declared",
+        }
+        digests = []
+        payloads = []
+        for concurrency in (1, 8):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "documents.txt"
+                source.write_text(
+                    "".join(f"document number {index}\n" for index in range(64)),
+                    encoding="utf-8",
+                )
+                cache = root / "corpus.f32"
+                declared = generate_cache(
+                    client=FakeEmbeddings(),
+                    source_path=source,
+                    cache_path=cache,
+                    fingerprint="fake-fp",
+                    model=model,
+                    role="corpus",
+                    batch_size=3,
+                    dimension=4,
+                    bindings={},
+                    concurrency=concurrency,
+                )
+                self.assertEqual(declared["cache"]["count"], 64)
+                self.assertEqual(
+                    declared["generation"]["request_concurrency"], concurrency
+                )
+                digests.append(hashlib.sha256(cache.read_bytes()).hexdigest())
+                payloads.append(declared["generation"]["payload_sha256"])
+        self.assertEqual(digests[0], digests[1])
+        self.assertEqual(payloads[0], payloads[1])
+
+    def test_concurrent_generation_surfaces_endpoint_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "documents.txt"
+            source.write_text(
+                "".join(f"document number {index}\n" for index in range(32)),
+                encoding="utf-8",
+            )
+            cache = root / "corpus.f32"
+            with self.assertRaisesRegex(RuntimeError, "interruption"):
+                generate_cache(
+                    client=FailAfterOneBatch(),
+                    source_path=source,
+                    cache_path=cache,
+                    fingerprint="fake-fp",
+                    model={
+                        "embedding_model": "fake",
+                        "native_fingerprint": "fake-fp",
+                        "declared_identity": "test",
+                        "artifact": None,
+                        "sha256": "b" * 64,
+                        "identity_strength": "declared",
+                    },
+                    role="corpus",
+                    batch_size=4,
+                    dimension=4,
+                    bindings={},
+                    concurrency=4,
+                )
+            self.assertFalse(cache.exists())
+            self.assertTrue(
+                cache.with_name(cache.name + ".checkpoint.json").exists()
+            )
+
     def test_repeated_stage_reuses_only_exact_protocol(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

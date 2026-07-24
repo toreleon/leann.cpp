@@ -189,6 +189,53 @@ class EmbeddingClient:
         raise RuntimeError(f"embedding request failed: {last_error}")
 
 
+def _iter_embedded_batches(
+    client: EmbeddingClient,
+    source_path: Path,
+    completed: int,
+    batch_size: int,
+    dimension_holder: list[int | None],
+    concurrency: int,
+) -> Iterator[tuple[list[str], np.ndarray]]:
+    """Yield (texts, vectors) strictly in source order.
+
+    A sequential client leaves the embedding server idle while it parses the
+    previous response, so cache generation runs far below the endpoint's
+    capacity. Requests are issued up to ``concurrency`` batches ahead, but
+    results are consumed in submission order, so the bytes appended to the
+    cache, the running payload digest, and the checkpoint row counts are
+    identical to the sequential path.
+    """
+
+    batches = _iter_batches(source_path, completed, batch_size)
+    if concurrency <= 1:
+        for texts in batches:
+            yield texts, client.embed(texts, dimension_holder[0])
+        return
+
+    import collections
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
+        pending: collections.deque[
+            tuple[list[str], concurrent.futures.Future[np.ndarray]]
+        ] = collections.deque()
+        try:
+            for texts in batches:
+                pending.append(
+                    (texts, pool.submit(client.embed, texts, dimension_holder[0]))
+                )
+                if len(pending) >= concurrency:
+                    ready_texts, ready = pending.popleft()
+                    yield ready_texts, ready.result()
+            while pending:
+                ready_texts, ready = pending.popleft()
+                yield ready_texts, ready.result()
+        finally:
+            for _, future in pending:
+                future.cancel()
+
+
 def _iter_batches(path: Path, start: int, batch_size: int) -> Iterator[list[str]]:
     batch: list[str] = []
     for index, line in enumerate(iter_nonempty_lines(path)):
@@ -280,6 +327,7 @@ def generate_cache(
     dimension: int | None,
     bindings: dict[str, Any],
     prefix_cache: Path | None = None,
+    concurrency: int = 1,
 ) -> dict[str, Any]:
     source_path = source_path.resolve()
     cache_path = cache_path.resolve()
@@ -457,10 +505,21 @@ def generate_cache(
                 "updated_at": utc_now(),
             },
         )
-    for texts in _iter_batches(source_path, completed, batch_size):
-        matrix = client.embed(texts, dimension)
+    # The header cannot be written until the first response reveals the
+    # dimension, so stay sequential until it is known and only then let the
+    # client run ahead of the writer.
+    dimension_holder: list[int | None] = [dimension]
+    for texts, matrix in _iter_embedded_batches(
+        client,
+        source_path,
+        completed,
+        batch_size,
+        dimension_holder,
+        1 if dimension is None else concurrency,
+    ):
         if dimension is None:
             dimension = int(matrix.shape[1])
+            dimension_holder[0] = dimension
             header = cache_v2_header(
                 dimension=dimension,
                 count=source["nonempty_lines"],
@@ -554,6 +613,7 @@ def generate_cache(
             "started_at": generation_started_at,
             "endpoint": client.url,
             "batch_size": batch_size,
+            "request_concurrency": concurrency,
             "normalization": "L2 float32 per row before persistence",
             "payload_sha256": payload_digest.hexdigest(),
             "prefix_seed": prefix_seed_info,
@@ -1823,6 +1883,17 @@ def add_embedding_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--api-key")
     parser.add_argument("--embedding-batch-size", type=int, default=64)
+    parser.add_argument(
+        "--embedding-concurrency",
+        type=int,
+        default=1,
+        help=(
+            "batches to keep in flight against the embedding endpoint. Results "
+            "are still consumed in source order, so the cache bytes are "
+            "unchanged; this only stops the endpoint idling between requests. "
+            "Requires an explicit --dimension."
+        ),
+    )
     parser.add_argument("--embedding-timeout", type=int, default=600)
     parser.add_argument("--embedding-retries", type=int, default=4)
     parser.add_argument("--dimension", type=int)
@@ -1954,6 +2025,13 @@ def make_client(args: argparse.Namespace) -> EmbeddingClient:
         raise ValueError("--embedding-batch-size must be positive")
     if args.dimension is not None and args.dimension <= 0:
         raise ValueError("--dimension must be positive")
+    concurrency = getattr(args, "embedding_concurrency", 1)
+    if concurrency <= 0:
+        raise ValueError("--embedding-concurrency must be positive")
+    if concurrency > 1 and args.dimension is None:
+        raise ValueError(
+            "--embedding-concurrency above 1 requires an explicit --dimension"
+        )
     return EmbeddingClient(
         args.embedding_url,
         args.embedding_model,
@@ -1977,6 +2055,7 @@ def prepare_shared(args: argparse.Namespace) -> dict[str, Any]:
         dimension=args.dimension,
         bindings={},
         prefix_cache=args.prefix_cache,
+        concurrency=args.embedding_concurrency,
     )
     corpus_sha = corpus_declared["cache"]["sha256"]
     query_declared = generate_cache(
