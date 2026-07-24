@@ -12,7 +12,12 @@ The machine-runnable clean-build command is:
 ```bash
 make HNSWLIB_DIR=/path/to/hnswlib \
   BUILD_DIR=/new/empty/build-directory \
-  test persistence-test core-safety-test
+  test persistence-test core-safety-test c-api-test
+cmake -S . -B /new/empty/cmake-build \
+  -DLEANN_HNSWLIB_SOURCE_DIR=/path/to/hnswlib
+cmake --build /new/empty/cmake-build --parallel
+ctest --test-dir /new/empty/cmake-build --output-on-failure
+python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 Validated on Apple arm64 with AppleClang 21:
@@ -74,6 +79,20 @@ Validated on Apple arm64 with AppleClang 21:
 - Compact upper-layer round trip and routing: pass.
 - Dense HNSW baseline from the same normalized embeddings: pass.
 - Benchmark embedding-cache round trip: pass.
+- Exact-source-bound `LEANNBC2` streaming build cache, complete-consumption
+  check, and cached fingerprint persistence: pass. `LEANNBC2` is not described
+  as self-authenticating because its payload and model digests live in the
+  surrounding benchmark evidence.
+- `LEANN_GT1` precomputed ground-truth validation and no-corpus benchmark
+  path: pass.
+- Exact-source-bound query-vector cache with index/embedder identity checks,
+  unmeasured warmup, and per-query raw CSV records: pass.
+- Single-search full and prefix recall reporting (`--top-k 10 --report-k 3`):
+  pass.
+- CLI cache/ground-truth parsing, atomic raw-result publication, benchmark
+  checkpoint recovery, endpoint/process attestation, official runtime binding,
+  independent embedding-parity recomputation, and strict result collection:
+  pass in the 66-test Python suite and all six CTest targets above.
 
 The sanitizer run initially exposed hnswlib's unaligned `size_t` label slot for
 even FP32 dimensions. The builder now gives only the temporary HNSW vectors one

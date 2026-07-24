@@ -24,6 +24,7 @@ endif()
 
 add_library(leann_cpp
     src/artifact_publisher.cpp
+    src/c_api.cpp
     src/checksum.cpp
     src/document_store.cpp
     src/embedder.cpp
@@ -38,6 +39,10 @@ target_include_directories(
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(leann_cpp PRIVATE hnswlib::hnswlib)
+target_compile_definitions(leann_cpp PRIVATE LEANN_C_API_EXPORTS=1)
+if(BUILD_SHARED_LIBS)
+    target_compile_definitions(leann_cpp PUBLIC LEANN_C_API_SHARED=1)
+endif()
 get_target_property(LEANN_HNSWLIB_INCLUDES hnswlib INTERFACE_INCLUDE_DIRECTORIES)
 if(LEANN_HNSWLIB_INCLUDES)
     target_include_directories(
@@ -78,9 +83,15 @@ if(LEANN_ENABLE_LLAMA)
 endif()
 
 add_executable(leann app/main.cpp)
+target_include_directories(leann PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(leann PRIVATE leann::leann hnswlib::hnswlib)
 if(LEANN_HNSWLIB_INCLUDES)
     target_include_directories(leann SYSTEM PRIVATE ${LEANN_HNSWLIB_INCLUDES})
+endif()
+if(MSVC)
+    target_compile_options(leann PRIVATE /W4 /permissive-)
+else()
+    target_compile_options(leann PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 if(LEANN_BUILD_TESTS)
@@ -98,6 +109,41 @@ if(LEANN_BUILD_TESTS)
     add_executable(leann_core_safety_tests tests/test_core_safety.cpp)
     target_link_libraries(leann_core_safety_tests PRIVATE leann::leann)
     add_test(NAME leann_core_safety_tests COMMAND leann_core_safety_tests)
+
+    add_executable(leann_c_api_tests tests/test_c_api.cpp)
+    target_link_libraries(leann_c_api_tests PRIVATE leann::leann)
+    add_test(NAME leann_c_api_tests COMMAND leann_c_api_tests)
+
+    # This source is compiled as strict C11 and linked with the C++ driver only
+    # after compilation, proving that the installed public header is C-safe.
+    add_executable(leann_c_header_tests tests/test_c_header.c)
+    set_target_properties(
+        leann_c_header_tests
+        PROPERTIES
+            C_STANDARD 11
+            C_STANDARD_REQUIRED YES
+            C_EXTENSIONS NO
+            LINKER_LANGUAGE CXX)
+    target_link_libraries(leann_c_header_tests PRIVATE leann::leann)
+    add_test(NAME leann_c_header_tests COMMAND leann_c_header_tests)
+
+    add_executable(leann_cli_cache_tests tests/test_cli_cache.cpp)
+    target_include_directories(
+        leann_cli_cache_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(
+        leann_cli_cache_tests PRIVATE leann::leann hnswlib::hnswlib)
+    if(LEANN_HNSWLIB_INCLUDES)
+        target_include_directories(
+            leann_cli_cache_tests SYSTEM PRIVATE ${LEANN_HNSWLIB_INCLUDES})
+    endif()
+    if(MSVC)
+        target_compile_options(
+            leann_cli_cache_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(
+            leann_cli_cache_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(NAME leann_cli_cache_tests COMMAND leann_cli_cache_tests)
 endif()
 
 if(LEANN_ENABLE_LLAMA)
