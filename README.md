@@ -164,6 +164,30 @@ calls into one callback are serialized for non-reentrant model sessions. See
 [the C API guide](docs/C_API.md) for the complete lifecycle, ownership rules,
 status handling, and a C11 example.
 
+For large repeatable builds, normalized embeddings can be streamed from an
+exact-source-bound cache without loading a GGUF model in the builder:
+
+```bash
+./build/leann build \
+  --docs work/datasets/nq/documents.txt \
+  --index out/nq \
+  --embedder cache \
+  --embedding-cache work/datasets/nq/model.leannbc2
+```
+
+`LEANNBC2` caches use this little-endian layout: the eight-byte
+`LEANNBC2` magic; `uint32` dimension; `uint64` row count; `uint32`
+fingerprint length; `uint64` exact source-document file size; the raw 32-byte
+SHA-256 of that file; the fingerprint bytes; then row-major normalized FP32
+vectors. The builder verifies the exact `--docs` bytes, declared shape, and
+cache length before building, streams vectors in build batches, and persists
+the cache's original embedder fingerprint. `LEANNBC2` does not contain its own
+payload or model digest, so it should not be treated as a self-authenticating
+artifact. The large-scale benchmark orchestrator and collector separately
+SHA-256-attest the cache bytes, model artifact, and ground-truth bindings.
+`cache` is deliberately rejected by `search` and `bench`; queries must use the
+real matching embedder.
+
 ## Benchmark
 
 `bench` computes dense exact ground truth in memory, then reports recall,
@@ -186,6 +210,117 @@ dense HNSW from the identical normalized embeddings:
 
 The optional cache is a benchmark-only artifact; it is never loaded by
 `search` and is not part of the low-storage index.
+
+At large scale, pass precomputed exact neighbors with `--ground-truth FILE`
+and leave `--dense-baseline 0` to skip corpus embedding and the in-process
+exact scan. The text format is:
+
+```text
+LEANN_GT1 <query-count> <k> <corpus-count>
+<id-0> <id-1> ... <id-k-1>
+... exactly one row per selected query
+```
+
+IDs are decimal zero-based document IDs. The standalone loader structurally
+validates the file and requires its header to match the complete query file
+and index corpus size before any `--max-queries` prefix is selected. Its
+encoded `k` must be
+at least `--top-k`; wider truth files are reused by taking each row's first
+requested IDs. Every row must contain exactly its encoded `k` in-range,
+non-duplicate IDs. Blank lines are ignored. Legacy `LEANNBC1` files remain
+supported by `--ground-truth-cache`. For published benchmark evidence, the
+orchestrator and collector additionally SHA-256-attest the truth, query-cache,
+corpus-cache, and model artifacts.
+
+Use `--query-embedding-cache FILE` to make different implementations consume
+identical precomputed query vectors. This is an exact-source-bound `LEANNBC2`
+cache whose source size and SHA-256 must match the exact `--queries` file.
+Its fingerprint and dimension must also match both the loaded index and the
+real query embedder. The cache supplies only query vectors: leann.cpp keeps
+the real llama.cpp embedder loaded for candidate recomputation.
+
+`bench` runs one unmeasured prefix query by default; set
+`--warmup-queries 0` to disable it or choose a larger prefix. Warmup searches
+do not contribute to recall, latency, or candidate counters. For durable raw
+observations, `--raw-latencies FILE` writes one CSV row per measured query
+with recall, compact-index latency, exact recomputations, approximate
+distances, upper-layer hops, embedding batches, and optional dense-HNSW
+latency/recall. Its final `result_ids` column records exactly `top-k` ranked
+decimal IDs separated by one ASCII space so a collector can independently
+recompute recall. The file is written to a same-directory temporary file,
+flushed, and atomically published only after all measured queries succeed.
+Warmup rows are never written.
+
+One wider search can report two recall cutoffs. For example,
+`--top-k 10 --report-k 3` performs only the top-10 retrieval and reports both
+`recall_at_10` and prefix `recall_at_3`, using the first three returned IDs
+against the first three exact IDs. The raw CSV gains a `recall_at_3` column
+only when this option is present. `--report-k` must be positive and no larger
+than `--top-k`; omitting it preserves the original output schema.
+
+### Publication-scale comparison workflow
+
+The large-scale harness prepares deterministic, nested 100K and 1M Natural
+Questions tiers and compares leann.cpp with the pinned official LEANN runtime.
+It is intentionally fail-closed: a publication report is rejected when a
+required sweep point, exact repetition, artifact hash, imported Python/FAISS
+module, native embedding-parity check, live llama-server process attestation,
+or ranked result ID is missing or inconsistent.
+
+The workflow is split into resumable tools:
+
+1. `prepare_beir_nq_scale.py` verifies and prepares the source archive,
+   document-ID mappings, exact tier prefixes, and dataset manifest.
+2. `run_large_scale_benchmark.py prepare` creates exact-source-bound corpus and
+   query caches plus blockwise exact top-k truth. `orchestrate` records an
+   explicit `--native-role gate` or `sweep`, exact warmup/repetition counts,
+   materialized commands, raw per-query results, runtime identity, and artifact
+   hashes.
+3. `validate_embedding_parity.py` independently compares native in-process
+   llama.cpp embeddings with the exact vectors consumed by official LEANN.
+4. `attest_embedding_endpoint.py capture` binds the live embedding endpoint to
+   its server process, executable, GGUF, build, and active cache checkpoint;
+   `finalize` binds that capture to the post-run parity evidence.
+5. `collect_large_scale_results.py` reopens and hashes the evidence, recomputes
+   parity and Recall@k independently, enforces the complete profile matrix, and
+   atomically publishes JSON, Markdown, and CSV outputs.
+
+Inspect each entry point before launching an expensive run:
+
+```bash
+python3 scripts/prepare_beir_nq_scale.py --help
+python3 scripts/run_large_scale_benchmark.py prepare --help
+python3 scripts/run_large_scale_benchmark.py orchestrate --help
+python3 scripts/validate_embedding_parity.py --help
+python3 scripts/attest_embedding_endpoint.py capture --help
+python3 scripts/attest_embedding_endpoint.py finalize --help
+python3 scripts/collect_large_scale_results.py --help
+```
+
+For the final two-tier publication, pass every native, official-cached, and
+official-real manifest for both tiers, one parity report per tier, and one
+finalized endpoint attestation per tier:
+
+```bash
+python3 scripts/collect_large_scale_results.py \
+  --manifest 100k=work/bench-nq/100k/native/manifest.json \
+  --manifest 100k=work/bench-nq/100k/official-cached/manifest.json \
+  --manifest 100k=work/bench-nq/100k/official-real/manifest.json \
+  --manifest 1m=work/bench-nq/1m/native/manifest.json \
+  --manifest 1m=work/bench-nq/1m/official-cached/manifest.json \
+  --manifest 1m=work/bench-nq/1m/official-real/manifest.json \
+  --parity 100k=work/bench-nq/100k/parity.json \
+  --parity 1m=work/bench-nq/1m/parity.json \
+  --endpoint-attestation 100k=work/bench-nq/100k/endpoint-attestation.json \
+  --endpoint-attestation 1m=work/bench-nq/1m/endpoint-attestation.json \
+  --required-tier 100k \
+  --required-tier 1m \
+  --output-prefix outputs/nq-scale
+```
+
+The collector never fills missing points with estimates. Use
+`--allow-incomplete` only for an explicitly labeled development report; do not
+use it for published comparisons.
 
 Prepare the public BEIR SciFact corpus and run a repeatable sweep:
 
