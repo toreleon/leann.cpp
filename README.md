@@ -16,6 +16,17 @@ spike:
 > recomputing document embeddings, and what recall/latency/storage trade-off
 > does that produce?
 
+## Demo
+
+`leann build` → `leann search` → `leann stats`, end to end with the built-in
+deterministic hash embedder (no model download, no Python service). The dense
+document vectors are discarded, yet the compact index still answers the query
+and reports exactly what it kept on disk:
+
+![leann.cpp terminal demo: build a compact index, run a search, then print index stats with the hash embedder](outputs/leann-cpp-demo.gif)
+
+Reproduce it with the [hash-backend quick start](#quick-start) below.
+
 ## What works
 
 - Native C++ runtime with no Python service.
