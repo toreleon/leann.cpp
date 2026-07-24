@@ -46,6 +46,9 @@ Reproduce it with the [hash-backend quick start](#quick-start) below.
   cosine-distance values before they can enter integer conversions or ranking.
 - Const, mutex-protected document reads so one immutable index/document pair
   can serve concurrent searches.
+- A versioned, dependency-free C11 read/search API with opaque handles,
+  caller-owned batched embedding callbacks, owned result bytes, and
+  thread-local errors.
 - `build`, `search`, `stats`, and exact-ground-truth `bench` commands, including
   a same-embedding dense HNSW baseline.
 - Reproducible BEIR SciFact preparation and parameter-sweep scripts.
@@ -81,7 +84,7 @@ non-llama path:
 ```bash
 make HNSWLIB_DIR=/path/to/hnswlib
 make HNSWLIB_DIR=/path/to/hnswlib \
-  test persistence-test core-safety-test
+  test persistence-test core-safety-test c-api-test
 ```
 
 ## Quick start
@@ -133,6 +136,33 @@ Use the hash backend to exercise the complete pipeline without a model:
   --embedder hash \
   --hash-dim 256
 ```
+
+## Embed with the C API
+
+Native applications can open an existing artifact pair and search it without
+starting the CLI or giving leann.cpp ownership of their model. Include
+`<leann/leann.h>`, provide a `leann_embed_batch_fn`, then use the opaque
+`leann_searcher` and `leann_results` handles:
+
+```c
+leann_embedder_v1 embedder = {
+    sizeof(leann_embedder_v1),
+    LEANN_C_API_VERSION,
+    app_session,
+    768,
+    {fingerprint, fingerprint_size},
+    app_embed_batch,
+};
+leann_searcher * searcher = NULL;
+leann_status status =
+    leann_searcher_open("out/demo", &embedder, &searcher);
+```
+
+The ABI is read/search-only and independent of llama.cpp types. It validates
+the artifact pair, dimension, and fingerprint before invoking the callback;
+calls into one callback are serialized for non-reentrant model sessions. See
+[the C API guide](docs/C_API.md) for the complete lifecycle, ownership rules,
+status handling, and a C11 example.
 
 ## Benchmark
 

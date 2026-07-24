@@ -15,6 +15,14 @@
 - Const, synchronized shared document reads with deterministic concurrency and
   sanitizer coverage.
 
+## Completed: native read/search C API
+
+- Versioned, dependency-free C11 ABI for opening an existing artifact pair and
+  searching through a caller-owned batched embedding callback.
+- Opaque search/result handles, copied result bytes, serialized callback
+  calls, thread-local error detail, and exception-safe status translation.
+- C11 compile proof plus C++ parity, failure, ownership, and concurrency tests.
+
 ## Completed in v0.2 spike
 
 - Native GGUF recomputation, versioned index/document formats, fingerprint
@@ -75,7 +83,8 @@ dataset too large for dense in-memory construction.
 
 - Add incremental append buffer and soft deletes.
 - Add a bounded hot embedding cache.
-- Expose a small C API and a llama.cpp-compatible retrieval example.
+- Add a pinned llama.cpp-compatible retrieval example over the completed C
+  callback ABI.
 - Add cancellation, progress, structured JSON output, and service mode.
 - Add stale-lock/backup inspection and recovery commands.
 - Package reproducible releases for macOS arm64 and Linux x86_64.
