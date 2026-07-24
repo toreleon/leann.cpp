@@ -463,5 +463,110 @@ class EmbeddingEndpointAttestationTest(unittest.TestCase):
             )
 
 
+class LinuxProcessProofTest(unittest.TestCase):
+    def test_hex_addresses_decode_for_both_families(self) -> None:
+        decode = attestation_module._linux_hex_address
+        self.assertEqual(decode("0100007F"), "127.0.0.1")
+        self.assertEqual(decode("00000000"), "0.0.0.0")
+        self.assertEqual(decode("00000000000000000000000001000000"), "::1")
+
+    def test_hex_address_rejects_unknown_width(self) -> None:
+        with self.assertRaises(AttestationError):
+            attestation_module._linux_hex_address("00FF")
+
+    def test_platform_dispatch_rejects_unsupported_platforms(self) -> None:
+        with mock.patch.object(attestation_module.sys, "platform", "sunos5"):
+            with self.assertRaisesRegex(AttestationError, "sunos5"):
+                attestation_module.platform_process_snapshot(
+                    host="127.0.0.1",
+                    port=1,
+                    expected_pid=None,
+                    expected_artifact=pathlib.Path("/nonexistent"),
+                )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux /proc")
+    def test_linux_snapshot_binds_a_real_listener(self) -> None:
+        import socket
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            model = root / "model.gguf"
+            model.write_bytes(b"synthetic-gguf")
+            listener = root / "listener.py"
+            listener.write_text(
+                "import socket, sys, time\n"
+                "s = socket.socket()\n"
+                "s.bind(('127.0.0.1', int(sys.argv[sys.argv.index('--port') + 1])))\n"
+                "s.listen(4)\n"
+                "time.sleep(60)\n",
+                encoding="utf-8",
+            )
+            probe = socket.socket()
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+            probe.close()
+
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(listener),
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(port),
+                    "--model",
+                    str(model),
+                ]
+            )
+            try:
+                deadline = time.time() + 15
+                snapshot = None
+                while time.time() < deadline:
+                    try:
+                        snapshot = attestation_module.linux_process_snapshot(
+                            host="127.0.0.1",
+                            port=port,
+                            expected_pid=process.pid,
+                            expected_artifact=model,
+                        )
+                        break
+                    except AttestationError:
+                        time.sleep(0.2)
+                self.assertIsNotNone(snapshot, "listener never became observable")
+                assert snapshot is not None
+                self.assertEqual(snapshot["provider"], "linux-proc-v1")
+                self.assertEqual(snapshot["pid"], process.pid)
+                self.assertEqual(
+                    snapshot["command_model_path"], str(model.resolve())
+                )
+                repeat = attestation_module.linux_process_snapshot(
+                    host="127.0.0.1",
+                    port=port,
+                    expected_pid=process.pid,
+                    expected_artifact=model,
+                )
+                self.assertEqual(
+                    repeat["identity_sha256"], snapshot["identity_sha256"]
+                )
+                with self.assertRaises(AttestationError):
+                    attestation_module.linux_process_snapshot(
+                        host="127.0.0.1",
+                        port=port,
+                        expected_pid=process.pid,
+                        expected_artifact=listener,
+                    )
+                with self.assertRaises(AttestationError):
+                    attestation_module.linux_process_snapshot(
+                        host="127.0.0.1",
+                        port=port,
+                        expected_pid=process.pid + 100000,
+                        expected_artifact=model,
+                    )
+            finally:
+                process.terminate()
+                process.wait(timeout=15)
+
+
 if __name__ == "__main__":
     unittest.main()
