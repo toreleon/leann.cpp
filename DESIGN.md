@@ -115,7 +115,7 @@ reopening a pathname that may have been replaced.
 
 ## Publication protocol
 
-An index build acquires empty-directory locks adjacent to both target files and
+An index build acquires directory locks adjacent to both target files and
 uses unique same-directory `.tmp.*` and `.bak.*` paths. It closes and validates
 the complete temporary pair before publication. Existing artifacts are moved
 to backups, the new document store is renamed into place, and the new index is
@@ -134,6 +134,41 @@ adjacent rename cannot make the loader validate one inode and parse another.
 If the new pair commits but backup or lock removal fails, the builder reports
 an explicit “committed; cleanup required” error and leaves the path available
 for recovery.
+
+### Lock descriptors
+
+Acquisition is the `create_directory` call itself. Immediately afterwards the
+builder writes an advisory `owner` file inside the lock recording `pid`,
+`host`, and `started_unix`, and removes it before removing the directory. The
+descriptor is metadata, never part of acquisition, so a binary that ignores it
+still interoperates and a lock left by an older binary is simply one with no
+descriptor. Unknown keys are ignored on read so the record can grow.
+
+The descriptor exists so `leann doctor` can distinguish "a lock exists" from
+"a lock whose owner is gone". It does not make staleness decidable: a pid is
+recycled, and a shared filesystem can be mounted on a second host. Liveness is
+reported as `running`, `absent`, or `unknown`, and a lock is removed only by an
+explicit `--force-unlock`, which refuses when the descriptor names a process
+running on this host. Removing a live lock would let two builders interleave
+their publication transactions, and pair identity cannot detect that: identity
+is derived from the corpus bytes alone, so two concurrent builds of the same
+corpus under different build parameters produce a cross that validates.
+
+### Cancellation boundary
+
+`BuildConfig::should_cancel` is polled at phase boundaries. Cancellation
+throws `leann::BuildCancelled`, and unwinding removes the temporary pair and
+the locks through the same RAII path an error takes, so a cancelled build
+leaves no `.lock`, `.tmp.*`, or `.bak.*` behind and publishes nothing.
+
+The final poll is after the temporary pair has been validated and before
+`publish_artifact_pair`. Cancellation is never observed inside the publication
+transaction, so an interrupt cannot produce a mixed pair.
+
+Cancellation is cooperative and therefore bounded rather than immediate. The
+two uncancellable spans are `DocumentStore::write` and
+`train_product_quantizer`, each a single opaque pass over the whole corpus;
+worst-case latency is one such pass.
 
 ## Invariants
 

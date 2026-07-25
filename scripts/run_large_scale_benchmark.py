@@ -988,13 +988,26 @@ def parse_native_metrics(output: str) -> dict[str, Any]:
     return metrics
 
 
+def is_build_residue(name: str) -> bool:
+    """True for a builder scratch or backup artifact.
+
+    ``Index::build`` names its temporaries and backups ``<artifact>.tmp.<token>``
+    and ``<artifact>.bak.<token>``, with a random token appended. A trailing
+    ``.tmp``/``.bak`` test therefore never matches them, so residue from an
+    interrupted build used to be folded into a stage's artifact set and made
+    the next run reject its own checkpoint as changed. The trailing forms are
+    still excluded in case an external tool produces them.
+    """
+    return ".tmp." in name or ".bak." in name or name.endswith((".tmp", ".bak"))
+
+
 def prefix_artifacts(prefix: Path, *, official: bool = False) -> list[Path]:
     prefix = prefix.resolve()
     pattern = f"{prefix.stem}*" if official else f"{prefix.name}.*"
     return [
         path
         for path in prefix.parent.glob(pattern)
-        if path.is_file() and not path.name.endswith((".tmp", ".bak"))
+        if path.is_file() and not is_build_residue(path.name)
     ]
 
 

@@ -6,8 +6,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <span>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace leann {
@@ -15,6 +18,26 @@ namespace leann {
 enum class ApproximationKind : std::uint32_t {
     SimHash = 1,
     ProductQuantization = 2,
+};
+
+// Reported to BuildConfig::report_progress as a build advances. `stage` names
+// one of the build's ordered phases and is a literal with static storage
+// duration. `total` is 0 when the phase length is not known in advance.
+struct BuildProgress {
+    std::string_view stage;
+    std::uint64_t completed = 0;
+    std::uint64_t total = 0;
+};
+
+// Thrown by Index::build when BuildConfig::should_cancel returns true. Build
+// cancellation is fail-closed: the partially written temporary artifacts and
+// the build locks are removed while unwinding, and no existing artifact pair
+// is modified, because cancellation is never observed once the publication
+// transaction has begun.
+class BuildCancelled : public std::runtime_error {
+  public:
+    explicit BuildCancelled(const std::string & message)
+        : std::runtime_error(message) {}
 };
 
 struct BuildConfig {
@@ -30,6 +53,10 @@ struct BuildConfig {
     std::uint32_t pq_training_samples = 4096;
     std::uint32_t embedding_batch_size = 32;
     std::uint32_t random_seed = 42;
+    // Optional observers. Both are called on the thread that called build, may
+    // be empty, and must not throw BuildCancelled themselves.
+    std::function<void(const BuildProgress &)> report_progress{};
+    std::function<bool()> should_cancel{};
 };
 
 struct SearchConfig {

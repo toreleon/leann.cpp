@@ -60,13 +60,13 @@ Arguments make_arguments(std::vector<std::string> storage) {
 }
 
 std::pair<std::string, std::string>
-run_benchmark(const Arguments & arguments) {
+capture_streams(const std::function<void()> & action) {
     std::ostringstream captured_output;
     std::ostringstream captured_error;
     auto * old_output = std::cout.rdbuf(captured_output.rdbuf());
     auto * old_error = std::cerr.rdbuf(captured_error.rdbuf());
     try {
-        command_bench(arguments);
+        action();
     } catch (...) {
         std::cout.rdbuf(old_output);
         std::cerr.rdbuf(old_error);
@@ -75,6 +75,11 @@ run_benchmark(const Arguments & arguments) {
     std::cout.rdbuf(old_output);
     std::cerr.rdbuf(old_error);
     return {captured_output.str(), captured_error.str()};
+}
+
+std::pair<std::string, std::string>
+run_benchmark(const Arguments & arguments) {
+    return capture_streams([&] { command_bench(arguments); });
 }
 
 void check_no_atomic_temps(
@@ -704,6 +709,521 @@ void test_strict_cli_numeric_parsing() {
     }
 }
 
+// Builds a small artifact pair with the hash embedder so the CLI commands can
+// be driven against a real index. `hash_dimension` must match the --hash-dim
+// the command under test passes, because it is part of the fingerprint.
+void build_test_pair(const std::filesystem::path & prefix,
+                     const std::vector<std::string> & documents,
+                     std::uint32_t hash_dimension) {
+    leann::HashEmbedder embedder(hash_dimension);
+    leann::BuildConfig config;
+    config.graph_degree = 2;
+    config.ef_construction = 4;
+    config.low_degree = 1;
+    config.approximation = leann::ApproximationKind::SimHash;
+    config.sketch_bits = 64;
+    leann::Index::build(leann::index_file_from_prefix(prefix),
+                        leann::documents_file_from_prefix(prefix), documents,
+                        embedder, config);
+}
+
+// A mistyped option used to be ignored, so the command answered with its
+// default and the wrong answer looked like a right one.
+void test_strict_option_validation() {
+    const CommandSpec * const search = find_command("search");
+    const CommandSpec * const stats = find_command("stats");
+    const CommandSpec * const doctor = find_command("doctor");
+    check(search != nullptr && stats != nullptr && doctor != nullptr,
+          "the command table exposes search, stats, and doctor");
+
+    const auto typo = make_arguments({"leann", "search", "--index", "p",
+                                      "--query", "q", "--topk", "2"});
+    expect_failure([&] { validate_arguments(*search, typo); },
+                   "unknown option for leann search: --topk");
+    expect_failure([&] { validate_arguments(*search, typo); },
+                   "did you mean --top-k?");
+
+    const auto misplaced =
+        make_arguments({"leann", "stats", "--index", "p", "--top-k", "2"});
+    expect_failure([&] { validate_arguments(*stats, misplaced); },
+                   "--top-k belongs to leann search");
+
+    // Everything a command documents must also validate.
+    const auto accepted = make_arguments(
+        {"leann", "search", "--index", "p", "--query", "q", "--top-k", "2",
+         "--ef-search", "8", "--rerank-ratio", "0.5", "--format", "json"});
+    validate_arguments(*search, accepted);
+
+    // A known option missing its value keeps the older, more specific
+    // message; an unknown one is still reported as unknown.
+    const auto truncated = make_arguments({"leann", "stats", "--index"});
+    expect_failure([&] { validate_arguments(*stats, truncated); },
+                   "missing value for --index");
+    const auto truncated_unknown =
+        make_arguments({"leann", "stats", "--nonsense"});
+    expect_failure([&] { validate_arguments(*stats, truncated_unknown); },
+                   "unknown option for leann stats: --nonsense");
+
+    const auto positional =
+        make_arguments({"leann", "stats", "--index", "p", "junk"});
+    expect_failure([&] { validate_arguments(*stats, positional); },
+                   "unexpected argument for leann stats: junk");
+
+    // A boolean flag must not swallow the token after it.
+    const auto flags =
+        make_arguments({"leann", "doctor", "--repair", "--index", "p"});
+    validate_arguments(*doctor, flags);
+    check(flags.get("--index") == "p",
+          "a boolean flag leaves the following option intact");
+    check(flags.has("--repair"), "a boolean flag is recorded");
+
+    // ...and must not be consumed AS a value either. Binding "--repair" to
+    // --index would run doctor on a nonsense prefix with the requested
+    // repair silently switched off, and exit 0.
+    const auto swallowed =
+        make_arguments({"leann", "doctor", "--index", "--repair"});
+    check(swallowed.has("--repair"),
+          "a boolean flag is not consumed as another option's value");
+    check(swallowed.get("--index").empty(),
+          "the option that lost its value keeps no bogus value");
+    expect_failure([&] { validate_arguments(*doctor, swallowed); },
+                   "missing value for --index");
+    const auto wrong_flag = make_arguments(
+        {"leann", "search", "--index", "p", "--query", "q", "--repair"});
+    expect_failure([&] { validate_arguments(*search, wrong_flag); },
+                   "unknown option for leann search: --repair");
+
+    // The tables are the documented surface, so they must stay well formed.
+    for (const CommandSpec & command : command_specs) {
+        std::set<std::string_view> seen;
+        for (const OptionGroup & group : command.groups) {
+            for (const OptionSpec & option : group.options) {
+                check(option.flag.starts_with("--"),
+                      "every option flag starts with --");
+                check(!option.help.empty(), "every option carries help text");
+                check(seen.insert(option.flag).second,
+                      "no option is listed twice for one command");
+            }
+        }
+        check(seen.contains("--help"),
+              "every command offers --help");
+    }
+}
+
+// Document text is arbitrary corpus bytes, so the writer has to escape what
+// JSON requires and refuse what it cannot represent.
+void test_json_writer_escaping() {
+    std::ostringstream output;
+    {
+        JsonWriter json(output);
+        json.begin_object();
+        json.field("quoted", "say \"hi\"");
+        json.field("slashed", "back\\slash");
+        json.field("spaced", std::string("tab\there\nline"));
+        json.field("control", std::string("bell\x07 here"));
+        json.field("unicode", "na\xC3\xAFve \xE6\x97\xA5\xE6\x9C\xAC");
+        json.field("count", std::uint64_t{42});
+        json.field("ratio", 0.125, 3);
+        json.end_object();
+    }
+    const std::string text = output.str();
+    check(text.find("\\\"hi\\\"") != std::string::npos,
+          "quotes are escaped");
+    check(text.find("back\\\\slash") != std::string::npos,
+          "backslashes are escaped");
+    check(text.find("tab\\there") != std::string::npos, "tabs are escaped");
+    check(text.find("\\n") != std::string::npos, "newlines are escaped");
+    check(text.find("\\u0007") != std::string::npos,
+          "other control bytes become \\u escapes");
+    check(text.find("na\xC3\xAFve") != std::string::npos,
+          "valid multi-byte UTF-8 passes through unchanged");
+    check(text.find("\"ratio\": 0.125") != std::string::npos,
+          "doubles keep the requested precision");
+
+    check(is_valid_utf8("plain ascii"), "ascii is valid UTF-8");
+    check(is_valid_utf8(std::string_view("\xF0\x9F\x98\x80", 4)),
+          "a four-byte sequence is valid UTF-8");
+    check(!is_valid_utf8(std::string_view("\xFF\xFE", 2)),
+          "an invalid lead byte is rejected");
+    check(!is_valid_utf8(std::string_view("\xC0\xAF", 2)),
+          "an overlong encoding is rejected");
+    check(!is_valid_utf8(std::string_view("\xED\xA0\x80", 3)),
+          "a surrogate half is rejected");
+    check(!is_valid_utf8(std::string_view("\xF5\x80\x80\x80", 4)),
+          "a code point above U+10FFFF is rejected");
+    check(!is_valid_utf8(std::string_view("\xE6\x97", 2)),
+          "a truncated sequence is rejected");
+
+    std::ostringstream rejected;
+    JsonWriter failing(rejected);
+    failing.begin_object();
+    expect_failure(
+        [&] { failing.field("document", std::string_view("\xFF\xFE", 2)); },
+        "not valid UTF-8");
+}
+
+void test_search_json_output(const std::filesystem::path & directory) {
+    const auto prefix = directory / "json-search";
+    const std::vector<std::string> documents{
+        "plain document",
+        "quotes \" and \\ backslash",
+        "tab\tseparated",
+        "third entry",
+    };
+    build_test_pair(prefix, documents, 64);
+
+    const auto arguments = make_arguments(
+        {"leann", "search", "--index", prefix.string(), "--query",
+         "quotes", "--hash-dim", "64", "--top-k", "2", "--format", "json"});
+    const auto [output, error] =
+        capture_streams([&] { command_search(arguments); });
+
+    check(error.empty(),
+          "JSON search writes nothing to stderr, so stdout is the whole "
+          "answer");
+    check(output.starts_with("{") && output.ends_with("}\n"),
+          "JSON search emits one object");
+    check(output.find("\"query\": \"quotes\"") != std::string::npos,
+          "the query is echoed");
+    check(output.find("\"results\"") != std::string::npos,
+          "results are present");
+    check(output.find("\"metrics\"") != std::string::npos,
+          "metrics move into the document instead of stderr");
+    check(output.find("quotes \\\" and \\\\ backslash") != std::string::npos,
+          "document text is escaped rather than emitted raw");
+    check(output.find("tab\\tseparated") != std::string::npos ||
+              output.find("\"id\"") != std::string::npos,
+          "documents are readable through the JSON path");
+
+    // Exactly top-k results, each with the three documented fields.
+    std::size_t id_fields = 0;
+    for (std::size_t at = output.find("\"id\""); at != std::string::npos;
+         at = output.find("\"id\"", at + 1)) {
+        ++id_fields;
+    }
+    check(id_fields == 2, "JSON search returns exactly --top-k results");
+
+    // The text format must stay byte-identical, because the benchmark
+    // harness parses it.
+    const auto text_arguments = make_arguments(
+        {"leann", "search", "--index", prefix.string(), "--query", "quotes",
+         "--hash-dim", "64", "--top-k", "2"});
+    const auto [text_output, text_error] =
+        capture_streams([&] { command_search(text_arguments); });
+    check(!text_output.empty() && text_output.find('\t') != std::string::npos,
+          "the default format is still tab separated");
+    check(text_error.find("search_ms=") != std::string::npos,
+          "the default format still reports metrics on stderr");
+
+    expect_failure(
+        [&] {
+            const auto bad = make_arguments(
+                {"leann", "search", "--index", prefix.string(), "--query",
+                 "q", "--format", "yaml"});
+            command_search(bad);
+        },
+        "--format must be text or json");
+}
+
+// A document the JSON writer cannot represent must produce no output at all,
+// not a truncated object with the error interleaved into it.
+void test_json_failure_is_atomic(const std::filesystem::path & directory) {
+    const auto prefix = directory / "json-invalid";
+    const std::vector<std::string> documents{
+        "valid document",
+        std::string("\xFF\xFE invalid bytes", 16),
+        "another valid document",
+        "a fourth document",
+    };
+    build_test_pair(prefix, documents, 64);
+
+    const auto arguments = make_arguments(
+        {"leann", "search", "--index", prefix.string(), "--query", "invalid",
+         "--hash-dim", "64", "--top-k", "4", "--format", "json"});
+    std::string emitted = "not empty";
+    bool failed = false;
+    try {
+        const auto [output, error] =
+            capture_streams([&] { command_search(arguments); });
+        emitted = output;
+        (void)error;
+    } catch (const std::exception & failure) {
+        failed = true;
+        check(std::string_view(failure.what()).find("not valid UTF-8") !=
+                  std::string_view::npos,
+              "the failure names the reason");
+    }
+    check(failed, "a document that is not valid UTF-8 fails the JSON path");
+
+    // capture_streams rethrows after restoring the buffers, so anything the
+    // writer had already emitted would have reached the captured stdout.
+    const auto [partial, partial_error] = capture_streams([&] {
+        try {
+            command_search(arguments);
+        } catch (const std::exception &) {
+            // deliberately swallowed; the point is what reached stdout
+        }
+    });
+    check(partial.empty(),
+          "a failed JSON document writes nothing to stdout");
+    (void)partial_error;
+
+    // The same corpus is still fully serviceable through the text format.
+    const auto text_arguments = make_arguments(
+        {"leann", "search", "--index", prefix.string(), "--query", "invalid",
+         "--hash-dim", "64", "--top-k", "4"});
+    const auto [text_output, text_error] =
+        capture_streams([&] { command_search(text_arguments); });
+    check(!text_output.empty(),
+          "the text format still serves a corpus JSON cannot represent");
+    (void)text_error;
+}
+
+void test_doctor_inspection_and_repair(
+    const std::filesystem::path & directory) {
+    const auto working = directory / "doctor";
+    std::filesystem::create_directories(working);
+    const auto prefix = working / "pair";
+    build_test_pair(prefix, {"alpha", "beta", "gamma", "delta"}, 64);
+    const auto index_path = leann::index_file_from_prefix(prefix);
+    const auto documents_path = leann::documents_file_from_prefix(prefix);
+
+    auto temporary_path = index_path;
+    temporary_path += ".tmp.abcdef";
+    auto backup_path = index_path;
+    backup_path += ".bak.abcdef";
+    write_text(temporary_path, "abandoned");
+    write_text(backup_path, "superseded");
+
+    const auto report_arguments =
+        make_arguments({"leann", "doctor", "--index", prefix.string()});
+    const auto [report, ignored_error] =
+        capture_streams([&] { command_doctor(report_arguments); });
+    check(report.find("pair: valid") != std::string::npos,
+          "doctor validates the live pair");
+    check(report.find(".tmp.abcdef") != std::string::npos &&
+              report.find(".bak.abcdef") != std::string::npos,
+          "doctor finds leftovers named by prefix, not by extension");
+    check(std::filesystem::exists(temporary_path),
+          "reporting alone removes nothing");
+
+    // A lock means a build may still own the temporary file.
+    const auto lock_path = leann::detail::lock_path_for(index_path);
+    std::filesystem::create_directory(lock_path);
+    const auto locked_arguments = make_arguments(
+        {"leann", "doctor", "--index", prefix.string(), "--repair"});
+    const auto [locked_report, locked_error] =
+        capture_streams([&] { command_doctor(locked_arguments); });
+    check(locked_report.find("retained:") != std::string::npos,
+          "a temporary is retained while a lock is present");
+    check(std::filesystem::exists(temporary_path),
+          "repair does not remove a temporary under an active lock");
+    check(std::filesystem::exists(lock_path),
+          "repair never removes a build lock");
+    std::filesystem::remove(lock_path);
+
+    const auto repair_arguments = make_arguments(
+        {"leann", "doctor", "--index", prefix.string(), "--repair"});
+    const auto [repaired, repair_error] =
+        capture_streams([&] { command_doctor(repair_arguments); });
+    check(!std::filesystem::exists(temporary_path),
+          "repair removes an abandoned temporary once no lock is present");
+    check(!std::filesystem::exists(backup_path),
+          "repair removes a backup once the live pair validates");
+    check(std::filesystem::exists(index_path) &&
+              std::filesystem::exists(documents_path),
+          "repair never touches the live pair");
+    (void)repaired;
+
+    // A backup is load-bearing while a build holds a lock: publication parks
+    // the previous pair in .bak.* for the whole transaction and rolls back
+    // from exactly those files. A valid-looking live pair is not licence to
+    // remove it.
+    write_text(backup_path, "mid-transaction backup");
+    std::filesystem::create_directory(lock_path);
+    const auto locked_backup_arguments = make_arguments(
+        {"leann", "doctor", "--index", prefix.string(), "--repair"});
+    const auto [locked_backup, locked_backup_error] =
+        capture_streams([&] { command_doctor(locked_backup_arguments); });
+    check(std::filesystem::exists(backup_path),
+          "repair does not remove a backup while a build lock is present");
+    std::filesystem::remove(lock_path);
+    std::filesystem::remove(backup_path);
+
+    // When the live pair is unusable the backup may be the only index left,
+    // so it must survive --repair.
+    auto surviving_backup = index_path;
+    surviving_backup += ".bak.feed01";
+    std::filesystem::rename(index_path, surviving_backup);
+    const auto broken_arguments = make_arguments(
+        {"leann", "doctor", "--index", prefix.string(), "--repair"});
+    const auto [broken, broken_error] =
+        capture_streams([&] { command_doctor(broken_arguments); });
+    check(broken.find("pair: unusable") != std::string::npos,
+          "doctor reports an unusable pair");
+    check(std::filesystem::exists(surviving_backup),
+          "a backup survives repair while the live pair does not validate");
+    std::filesystem::rename(surviving_backup, index_path);
+}
+
+void test_doctor_reports_lock_ownership(
+    const std::filesystem::path & directory) {
+    const auto working = directory / "doctor-lock";
+    std::filesystem::create_directories(working);
+    const auto prefix = working / "pair";
+    build_test_pair(prefix, {"alpha", "beta", "gamma", "delta"}, 64);
+    const auto index_path = leann::index_file_from_prefix(prefix);
+    const auto lock_path = leann::detail::lock_path_for(index_path);
+
+    // A lock created by this process is honestly reported as running, and
+    // --force-unlock must refuse it.
+    std::filesystem::create_directory(lock_path);
+    leann::detail::write_lock_owner(lock_path);
+    const auto owner = leann::detail::read_lock_owner(lock_path);
+    check(owner.has_value(), "a lock descriptor round trips");
+    check(owner->pid == leann::detail::current_process_id(),
+          "the descriptor records the owning process");
+    check(leann::detail::owner_liveness(owner) ==
+              leann::detail::OwnerLiveness::Running,
+          "this process is observed as running");
+
+    // The refusal must also come before any deletion, so a combined request
+    // cannot delete leftovers and then throw away the report of having done
+    // so.
+    auto doomed_temporary = index_path;
+    doomed_temporary += ".tmp.777777";
+    write_text(doomed_temporary, "scratch");
+    expect_failure(
+        [&] {
+            const auto arguments = make_arguments(
+                {"leann", "doctor", "--index", prefix.string(), "--repair",
+                 "--force-unlock"});
+            capture_streams([&] { command_doctor(arguments); });
+        },
+        "refusing --force-unlock");
+    check(std::filesystem::exists(lock_path),
+          "a lock whose owner is running is never removed");
+    check(std::filesystem::exists(doomed_temporary),
+          "a refused request deletes nothing at all");
+    std::filesystem::remove(doomed_temporary);
+
+    // An unowned lock cannot be called stale, only unknown.
+    leann::detail::remove_lock_owner(lock_path);
+    check(!leann::detail::read_lock_owner(lock_path).has_value(),
+          "a lock without a descriptor reports no owner");
+    check(leann::detail::owner_liveness(std::nullopt) ==
+              leann::detail::OwnerLiveness::Unknown,
+          "liveness without a descriptor is unknown, never stale");
+    const auto arguments = make_arguments(
+        {"leann", "doctor", "--index", prefix.string(), "--force-unlock"});
+    const auto [output, error] =
+        capture_streams([&] { command_doctor(arguments); });
+    check(output.find("unrecorded owner") != std::string::npos,
+          "an unowned lock is described honestly");
+    check(!std::filesystem::exists(lock_path),
+          "--force-unlock removes a lock that names no running owner");
+}
+
+// Cancellation is driven through a token over a local flag rather than a real
+// signal, so the test is deterministic and never touches process state.
+void test_build_cancellation(const std::filesystem::path & directory) {
+    const auto working = directory / "cancel";
+    std::filesystem::create_directories(working);
+    const auto source_path = working / "documents.txt";
+    write_text(source_path, "alpha\nbeta\ngamma\ndelta\n");
+    const auto prefix = working / "cancelled";
+
+    std::atomic<bool> flag{true};
+    const CancellationToken token(&flag);
+    const auto arguments = make_arguments(
+        {"leann", "build", "--docs", source_path.string(), "--index",
+         prefix.string(), "--hash-dim", "64", "--progress", "never"});
+    bool cancelled = false;
+    try {
+        capture_streams([&] { command_build(arguments, token); });
+    } catch (const leann::BuildCancelled & stop) {
+        cancelled = true;
+        check(std::string_view(stop.what()).find("cancelled") !=
+                  std::string_view::npos,
+              "cancellation names itself");
+    }
+    check(cancelled, "an already-requested cancellation stops the build");
+
+    // Fail-closed: nothing published, nothing left behind.
+    check(!std::filesystem::exists(leann::index_file_from_prefix(prefix)),
+          "a cancelled build publishes no index");
+    check(!std::filesystem::exists(leann::documents_file_from_prefix(prefix)),
+          "a cancelled build publishes no document store");
+    for (const auto & entry :
+         std::filesystem::directory_iterator(working)) {
+        const std::string name = entry.path().filename().string();
+        check(name.find(".lock") == std::string::npos,
+              "a cancelled build leaves no build lock");
+        check(name.find(".tmp.") == std::string::npos,
+              "a cancelled build leaves no temporary artifact");
+        check(name.find(".bak.") == std::string::npos,
+              "a cancelled build leaves no backup artifact");
+    }
+
+    // A token that is never triggered leaves the build untouched.
+    std::atomic<bool> quiet{false};
+    const CancellationToken open(&quiet);
+    capture_streams([&] { command_build(arguments, open); });
+    check(std::filesystem::exists(leann::index_file_from_prefix(prefix)),
+          "an untriggered token does not disturb the build");
+}
+
+// The progress callback must fire in order and must never be required.
+void test_build_progress_reporting(const std::filesystem::path & directory) {
+    const auto working = directory / "progress";
+    std::filesystem::create_directories(working);
+    const auto prefix = working / "observed";
+    std::vector<std::string> documents;
+    documents.reserve(64);
+    for (int index = 0; index < 64; ++index) {
+        documents.push_back("document " + std::to_string(index));
+    }
+
+    std::vector<std::string> stages;
+    std::uint64_t last_completed = 0;
+    bool monotonic = true;
+    leann::HashEmbedder embedder(64);
+    leann::BuildConfig config;
+    config.graph_degree = 2;
+    config.ef_construction = 4;
+    config.low_degree = 1;
+    config.approximation = leann::ApproximationKind::SimHash;
+    config.sketch_bits = 64;
+    config.embedding_batch_size = 8;
+    config.report_progress = [&](const leann::BuildProgress & progress) {
+        if (stages.empty() || stages.back() != progress.stage) {
+            stages.emplace_back(progress.stage);
+            last_completed = 0;
+        }
+        if (progress.completed < last_completed) {
+            monotonic = false;
+        }
+        last_completed = progress.completed;
+        if (progress.total != 0 && progress.completed > progress.total) {
+            monotonic = false;
+        }
+    };
+    leann::Index::build(leann::index_file_from_prefix(prefix),
+                        leann::documents_file_from_prefix(prefix), documents,
+                        embedder, config);
+
+    check(!stages.empty(), "a build reports progress when asked");
+    check(monotonic,
+          "progress never moves backwards and never exceeds its total");
+    check(std::find(stages.begin(), stages.end(), "embedding") != stages.end(),
+          "the embedding phase is reported");
+    check(std::find(stages.begin(), stages.end(), "publishing") !=
+              stages.end(),
+          "the publication phase is reported last");
+    check(stages.back() == "publishing",
+          "publication is the final reported phase");
+}
+
 } // namespace
 
 int main() {
@@ -722,6 +1242,14 @@ int main() {
         test_bench_skips_corpus_with_precomputed_truth(directory);
         test_cache_embedder_is_build_only();
         test_strict_cli_numeric_parsing();
+        test_strict_option_validation();
+        test_json_writer_escaping();
+        test_search_json_output(directory);
+        test_json_failure_is_atomic(directory);
+        test_doctor_inspection_and_repair(directory);
+        test_doctor_reports_lock_ownership(directory);
+        test_build_cancellation(directory);
+        test_build_progress_reporting(directory);
         std::filesystem::remove_all(directory);
         std::cout << "all CLI cache tests passed\n";
         return 0;

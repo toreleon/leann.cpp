@@ -1,6 +1,7 @@
 #include "leann/document_store.hpp"
 #include "leann/embedder.hpp"
 #include "leann/index.hpp"
+#include "build_lock.hpp"
 #include "checksum.hpp"
 
 #include <hnswlib/hnswlib.h>
@@ -11,17 +12,22 @@
 #include <bit>
 #include <cerrno>
 #include <charconv>
+#include <concepts>
 #include <chrono>
 #include <cmath>
+#include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <numeric>
 #include <optional>
+#include <ranges>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -36,6 +42,7 @@
 
 #ifdef _WIN32
 #define NOMINMAX
+#include <io.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -44,18 +51,47 @@
 
 namespace {
 
+#ifndef LEANN_VERSION_STRING
+// Kept as a fallback definition rather than a generated header so the
+// documented CMake-free `make` path still compiles app/main.cpp.
+#define LEANN_VERSION_STRING "0.4.0"
+#endif
+
+// Options that never consume the following token. Kept global rather than
+// per-command because argv is parsed before the command's specification is
+// selected; a boolean flag offered to the wrong command is rejected later by
+// validate_arguments.
+constexpr std::array<std::string_view, 3> boolean_flag_names{
+    "--help",
+    "--repair",
+    "--force-unlock",
+};
+
+[[nodiscard]] bool is_boolean_flag(std::string_view key) {
+    return std::find(boolean_flag_names.begin(), boolean_flag_names.end(),
+                     key) != boolean_flag_names.end();
+}
+
 class Arguments {
   public:
     Arguments(int argc, char ** argv) {
         for (int i = 2; i < argc; ++i) {
             std::string key = argv[i];
             if (key.starts_with("--")) {
-                if (key == "--help") {
-                    flags_.insert(key);
+                if (is_boolean_flag(key)) {
+                    flags_.insert(std::move(key));
                     continue;
                 }
-                if (i + 1 >= argc) {
-                    throw std::invalid_argument("missing value for " + key);
+                // A boolean flag is never a value. Without this,
+                // `--index --repair` binds "--repair" as the index prefix and
+                // the flag disappears, so the command runs on a nonsense path
+                // with the requested behaviour silently switched off.
+                if (i + 1 >= argc || is_boolean_flag(argv[i + 1])) {
+                    // Recorded rather than rejected here so validation can
+                    // tell an unknown option apart from a known one whose
+                    // value was omitted.
+                    valueless_.insert(std::move(key));
+                    continue;
                 }
                 values_[std::move(key)] = argv[++i];
             } else {
@@ -67,6 +103,26 @@ class Arguments {
     [[nodiscard]] bool has(std::string_view key) const {
         return values_.contains(std::string(key)) ||
                flags_.contains(std::string(key));
+    }
+
+    [[nodiscard]] const std::unordered_map<std::string, std::string> &
+    values() const noexcept {
+        return values_;
+    }
+
+    [[nodiscard]] const std::unordered_set<std::string> &
+    flags() const noexcept {
+        return flags_;
+    }
+
+    [[nodiscard]] const std::unordered_set<std::string> &
+    valueless() const noexcept {
+        return valueless_;
+    }
+
+    [[nodiscard]] const std::vector<std::string> &
+    positional() const noexcept {
+        return positional_;
     }
 
     [[nodiscard]] std::string get(std::string_view key,
@@ -146,6 +202,7 @@ class Arguments {
   private:
     std::unordered_map<std::string, std::string> values_;
     std::unordered_set<std::string> flags_;
+    std::unordered_set<std::string> valueless_;
     std::vector<std::string> positional_;
 };
 
@@ -861,49 +918,829 @@ leann::SearchConfig search_config(const Arguments & args) {
     return config;
 }
 
-void print_usage(std::ostream & output) {
-    output
-        << "leann.cpp — native low-storage vector search\n\n"
-        << "Usage:\n"
-        << "  leann build  --docs FILE --index PREFIX [embedding/build options]\n"
-        << "  leann search --index PREFIX --query TEXT [embedding/search options]\n"
-        << "  leann bench  --index PREFIX --queries FILE [embedding/search options]\n"
-        << "  leann stats  --index PREFIX\n\n"
-        << "Embedding options:\n"
-        << "  --embedder hash|llama     query-capable embedding backend\n"
-        << "  --model FILE              GGUF embedding model for llama.cpp\n"
-        << "  --hash-dim N              hash backend dimension (default 256)\n"
-        << "  --ctx N --batch-tokens N --parallel N --threads N --gpu-layers N\n\n"
-        << "Build options:\n"
-        << "  --embedder cache          stream a verified LEANNBC2 cache (build only)\n"
-        << "  --embedding-cache FILE    cache bound to the exact --docs bytes\n"
-        << "  --graph-degree N          hnswlib M (default 16)\n"
-        << "  --ef-construction N       hnswlib build ef (default 100)\n"
-        << "  --low-degree N            outgoing cap for non-hubs (default 3)\n"
-        << "  --hub-ratio F             fraction of preserved hubs (default 0.02)\n"
-        << "  --approx pq|simhash       approximate distance backend (default pq)\n"
-        << "  --pq-subquantizers N      PQ subspaces; must divide dimension (default 64)\n"
-        << "  --pq-bits N               bits per PQ code, 1..8 (default 4)\n"
-        << "  --pq-iterations N         Lloyd iterations (default 10)\n"
-        << "  --pq-training-samples N   maximum training vectors (default 4096)\n"
-        << "  --sketch-bits N           SimHash bits for simhash mode (default 128)\n"
-        << "  --embedding-batch N       build embedding batch (default 32)\n\n"
-        << "Search options:\n"
-        << "  --top-k N --ef-search N --recompute-batch N --rerank-ratio F\n"
-        << "  --scan-limit N            flat ADC below N nodes; 0 forces graph\n\n"
-        << "Benchmark options:\n"
-        << "  --dense-baseline 0|1      build and measure dense HNSW (default 0)\n"
-        << "  --dense-m N --dense-ef-construction N --dense-ef-search N\n"
-        << "  --ground-truth-cache FILE reuse benchmark-only dense embeddings\n"
-        << "  --ground-truth FILE       precomputed LEANN_GT1 exact neighbor IDs\n"
-        << "  --query-embedding-cache FILE verified LEANNBC2 query vectors\n"
-        << "  --warmup-queries N        unmeasured prefix warmup (default 1)\n"
-        << "  --report-k N              also report prefix recall; N <= top-k\n"
-        << "  --raw-latencies FILE      per-query CSV latency/candidate records\n"
-        << "  --max-queries N            deterministic prefix; 0 means all\n";
+// ---------------------------------------------------------------------------
+// Structured output
+//
+// Hand-written because the repository takes no third-party dependency for
+// hashing or serialization. Document text is arbitrary corpus bytes, so the
+// writer validates UTF-8 and fails closed rather than emitting a document that
+// would silently corrupt a consumer's parse.
+// ---------------------------------------------------------------------------
+
+// Length of the UTF-8 sequence introduced by `lead`, or 0 if it is not a legal
+// lead byte.
+[[nodiscard]] std::size_t utf8_sequence_length(unsigned char lead) {
+    if (lead < 0x80U) {
+        return 1;
+    }
+    if ((lead & 0xE0U) == 0xC0U) {
+        return 2;
+    }
+    if ((lead & 0xF0U) == 0xE0U) {
+        return 3;
+    }
+    if ((lead & 0xF8U) == 0xF0U) {
+        return 4;
+    }
+    return 0;
 }
 
-void command_build(const Arguments & args) {
+// Rejects overlong encodings, surrogate halves, and anything above U+10FFFF,
+// so a "valid" string here is valid to every conforming JSON reader.
+[[nodiscard]] bool is_valid_utf8(std::string_view text) {
+    std::size_t index = 0;
+    while (index < text.size()) {
+        const auto lead = static_cast<unsigned char>(text[index]);
+        const std::size_t length = utf8_sequence_length(lead);
+        if (length == 0 || index + length > text.size()) {
+            return false;
+        }
+        std::uint32_t code_point = 0;
+        switch (length) {
+        case 1:
+            code_point = lead;
+            break;
+        case 2:
+            code_point = lead & 0x1FU;
+            break;
+        case 3:
+            code_point = lead & 0x0FU;
+            break;
+        default:
+            code_point = lead & 0x07U;
+            break;
+        }
+        for (std::size_t offset = 1; offset < length; ++offset) {
+            const auto continuation =
+                static_cast<unsigned char>(text[index + offset]);
+            if ((continuation & 0xC0U) != 0x80U) {
+                return false;
+            }
+            code_point = (code_point << 6U) | (continuation & 0x3FU);
+        }
+        static constexpr std::array<std::uint32_t, 5> minimum{
+            0U, 0U, 0x80U, 0x800U, 0x10000U};
+        if (code_point < minimum[length] || code_point > 0x10FFFFU ||
+            (code_point >= 0xD800U && code_point <= 0xDFFFU)) {
+            return false;
+        }
+        index += length;
+    }
+    return true;
+}
+
+class JsonWriter {
+  public:
+    explicit JsonWriter(std::ostream & output)
+        : output_(output),
+          saved_flags_(output.flags()),
+          saved_precision_(output.precision()),
+          saved_fill_(output.fill()) {}
+
+    // Number and fill formatting are stream-sticky, so they are restored
+    // rather than left for whatever writes to the stream next.
+    ~JsonWriter() {
+        output_.flags(saved_flags_);
+        output_.precision(saved_precision_);
+        output_.fill(saved_fill_);
+    }
+
+    JsonWriter(const JsonWriter &) = delete;
+    JsonWriter & operator=(const JsonWriter &) = delete;
+
+    void begin_object() {
+        separate();
+        output_ << "{";
+        push();
+    }
+
+    void end_object() {
+        pop();
+        output_ << "}";
+        if (depth_ == 0) {
+            output_ << '\n';
+        }
+    }
+
+    void begin_object_field(std::string_view key) {
+        write_key(key);
+        output_ << "{";
+        push();
+    }
+
+    void begin_array(std::string_view key) {
+        write_key(key);
+        output_ << "[";
+        push();
+    }
+
+    void end_array() {
+        pop();
+        output_ << "]";
+    }
+
+    void begin_element() {
+        separate();
+        output_ << "{";
+        push();
+    }
+
+    void field(std::string_view key, std::string_view value) {
+        write_key(key);
+        write_string(value, key);
+    }
+
+    void field(std::string_view key, std::uint64_t value) {
+        write_key(key);
+        output_ << value;
+    }
+
+    // Constrained to exactly bool. An unconstrained overload would win for a
+    // string literal, because const char* -> bool is a standard conversion
+    // while const char* -> string_view is a user-defined one, so every
+    // literal would silently be emitted as `true`.
+    template <typename Boolean>
+        requires std::same_as<Boolean, bool>
+    void field(std::string_view key, Boolean value) {
+        write_key(key);
+        output_ << (value ? "true" : "false");
+    }
+
+    // Fixed notation with an explicit precision so a consumer sees the same
+    // digits the text output shows.
+    void field(std::string_view key, double value, int precision) {
+        write_key(key);
+        if (!std::isfinite(value)) {
+            throw std::runtime_error(
+                "refusing to emit a non-finite value for " + std::string(key));
+        }
+        output_ << std::fixed << std::setprecision(precision) << value
+                << std::defaultfloat;
+    }
+
+  private:
+    void push() {
+        ++depth_;
+        first_.push_back(true);
+    }
+
+    void pop() {
+        if (!first_.empty()) {
+            const bool empty = first_.back();
+            first_.pop_back();
+            --depth_;
+            if (!empty) {
+                newline();
+            }
+        }
+    }
+
+    void newline() {
+        output_ << '\n' << std::string(depth_ * 2U, ' ');
+    }
+
+    void separate() {
+        if (first_.empty()) {
+            return;
+        }
+        if (!first_.back()) {
+            output_ << ',';
+        }
+        first_.back() = false;
+        newline();
+    }
+
+    void write_key(std::string_view key) {
+        separate();
+        write_string(key, key);
+        output_ << ": ";
+    }
+
+    void write_string(std::string_view value, std::string_view context) {
+        if (!is_valid_utf8(value)) {
+            throw std::runtime_error(
+                "cannot emit JSON for " + std::string(context) +
+                ": value is not valid UTF-8; use --format text");
+        }
+        output_ << '"';
+        for (const char raw : value) {
+            const auto byte = static_cast<unsigned char>(raw);
+            switch (byte) {
+            case '"':
+                output_ << "\\\"";
+                break;
+            case '\\':
+                output_ << "\\\\";
+                break;
+            case '\n':
+                output_ << "\\n";
+                break;
+            case '\r':
+                output_ << "\\r";
+                break;
+            case '\t':
+                output_ << "\\t";
+                break;
+            case '\b':
+                output_ << "\\b";
+                break;
+            case '\f':
+                output_ << "\\f";
+                break;
+            default:
+                if (byte < 0x20U) {
+                    output_ << "\\u" << std::hex << std::setw(4)
+                            << std::setfill('0')
+                            << static_cast<unsigned int>(byte) << std::dec
+                            << std::setfill(' ');
+                } else {
+                    output_ << raw;
+                }
+                break;
+            }
+        }
+        output_ << '"';
+    }
+
+    std::ostream & output_;
+    std::ios_base::fmtflags saved_flags_;
+    std::streamsize saved_precision_;
+    char saved_fill_;
+    std::size_t depth_ = 0;
+    std::vector<bool> first_;
+};
+
+// Buffers a JSON document and forwards it only once it is complete. Without
+// this, a document that fails validation partway through — an invalid UTF-8
+// chunk, a non-finite metric — would already have written a truncated object
+// onto the caller's parsed stream, with the error text interleaved into it.
+class JsonDocument {
+  public:
+    explicit JsonDocument(std::ostream & destination)
+        : destination_(destination), writer_(buffer_) {}
+
+    JsonDocument(const JsonDocument &) = delete;
+    JsonDocument & operator=(const JsonDocument &) = delete;
+
+    [[nodiscard]] JsonWriter & writer() noexcept {
+        return writer_;
+    }
+
+    void commit() {
+        destination_ << buffer_.str();
+    }
+
+  private:
+    std::ostream & destination_;
+    std::ostringstream buffer_;
+    JsonWriter writer_;
+};
+
+enum class OutputFormat {
+    Text,
+    Json,
+};
+
+[[nodiscard]] OutputFormat output_format(const Arguments & args) {
+    const std::string value = args.get("--format", "text");
+    if (value == "text") {
+        return OutputFormat::Text;
+    }
+    if (value == "json") {
+        return OutputFormat::Json;
+    }
+    throw std::invalid_argument("--format must be text or json");
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation
+//
+// The flag lives at file scope because only a signal handler can set it, but
+// commands read it through a token they are handed. That keeps the signal
+// path out of the tests: a test constructs a token over its own flag and
+// drives cancellation deterministically without raising anything.
+// ---------------------------------------------------------------------------
+
+std::atomic<bool> interrupt_requested{false};
+static_assert(std::atomic<bool>::is_always_lock_free,
+              "the interrupt flag is read and written from a signal handler");
+
+extern "C" void handle_interrupt(int signal_number) {
+    interrupt_requested.store(true, std::memory_order_relaxed);
+    // Restore the default disposition so a second signal always terminates.
+    // Cancellation is cooperative and cannot interrupt a long uncancellable
+    // span, so without this a user who keeps pressing Ctrl-C would have no
+    // way out. The residue a forced termination leaves is what `leann doctor`
+    // is for.
+    std::signal(signal_number, SIG_DFL);
+}
+
+class CancellationToken {
+  public:
+    CancellationToken() = default;
+
+    explicit CancellationToken(const std::atomic<bool> * flag) noexcept
+        : flag_(flag) {}
+
+    [[nodiscard]] bool requested() const noexcept {
+        return flag_ != nullptr && flag_->load(std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] std::function<bool()> predicate() const {
+        if (flag_ == nullptr) {
+            return {};
+        }
+        const std::atomic<bool> * flag = flag_;
+        return [flag] { return flag->load(std::memory_order_relaxed); };
+    }
+
+    void throw_if_requested(std::string_view stage) const {
+        if (requested()) {
+            throw leann::BuildCancelled("cancelled during " +
+                                        std::string(stage));
+        }
+    }
+
+  private:
+    const std::atomic<bool> * flag_ = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// Progress
+// ---------------------------------------------------------------------------
+
+[[nodiscard]] bool stderr_is_terminal() noexcept {
+#ifdef _WIN32
+    return _isatty(_fileno(stderr)) != 0;
+#else
+    return ::isatty(STDERR_FILENO) != 0;
+#endif
+}
+
+// Writes a single rewritten line to stderr. Never touches stdout, so it cannot
+// contaminate a parsed result stream, and stays silent unless asked.
+class ProgressReporter {
+  public:
+    ProgressReporter(const Arguments & args, std::string_view mode_option) {
+        const std::string mode = args.get(mode_option, "auto");
+        if (mode == "never") {
+            enabled_ = false;
+        } else if (mode == "always") {
+            enabled_ = true;
+        } else if (mode == "auto") {
+            enabled_ = stderr_is_terminal();
+        } else {
+            throw std::invalid_argument(std::string(mode_option) +
+                                        " must be auto, always, or never");
+        }
+        started_ = std::chrono::steady_clock::now();
+        last_ = started_;
+    }
+
+    [[nodiscard]] bool enabled() const noexcept {
+        return enabled_;
+    }
+
+    void report(std::string_view stage, std::uint64_t completed,
+                std::uint64_t total) {
+        if (!enabled_) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const bool stage_changed = stage != stage_;
+        const double since_last =
+            std::chrono::duration<double>(now - last_).count();
+        if (!stage_changed && completed != total && since_last < 0.1) {
+            return;
+        }
+        if (stage_changed) {
+            stage_ = stage;
+            stage_started_ = now;
+        }
+        last_ = now;
+
+        std::ostringstream line;
+        line << stage;
+        if (total > 0) {
+            const double fraction =
+                static_cast<double>(completed) / static_cast<double>(total);
+            line << ' ' << completed << '/' << total << " ("
+                 << std::fixed << std::setprecision(1) << (fraction * 100.0)
+                 << "%)";
+            const double elapsed =
+                std::chrono::duration<double>(now - stage_started_).count();
+            if (elapsed > 0.5 && completed > 0) {
+                const double rate = static_cast<double>(completed) / elapsed;
+                line << ' ' << std::setprecision(0) << rate << "/s";
+                if (completed < total) {
+                    line << " eta "
+                         << format_duration(
+                                static_cast<double>(total - completed) / rate);
+                }
+            }
+        }
+        write_line(line.str());
+    }
+
+    // Clears the transient line so the command's real output starts clean.
+    void finish() {
+        if (!enabled_ || width_ == 0) {
+            return;
+        }
+        std::cerr << '\r' << std::string(width_, ' ') << '\r' << std::flush;
+        width_ = 0;
+    }
+
+    ~ProgressReporter() {
+        try {
+            finish();
+        } catch (...) {
+            // A failure to clear the progress line must not mask the error
+            // that is already unwinding.
+        }
+    }
+
+    ProgressReporter(const ProgressReporter &) = delete;
+    ProgressReporter & operator=(const ProgressReporter &) = delete;
+
+  private:
+    static std::string format_duration(double seconds) {
+        if (!std::isfinite(seconds) || seconds < 0.0) {
+            return "?";
+        }
+        const auto total = static_cast<std::uint64_t>(seconds);
+        std::ostringstream text;
+        if (total >= 3600U) {
+            text << (total / 3600U) << 'h' << ((total % 3600U) / 60U) << 'm';
+        } else if (total >= 60U) {
+            text << (total / 60U) << 'm' << (total % 60U) << 's';
+        } else {
+            text << total << 's';
+        }
+        return text.str();
+    }
+
+    void write_line(const std::string & line) {
+        std::cerr << '\r' << line;
+        if (line.size() < width_) {
+            std::cerr << std::string(width_ - line.size(), ' ');
+        }
+        std::cerr << std::flush;
+        width_ = std::max(width_, line.size());
+    }
+
+    bool enabled_ = false;
+    std::size_t width_ = 0;
+    std::string stage_;
+    std::chrono::steady_clock::time_point started_{};
+    std::chrono::steady_clock::time_point stage_started_{};
+    std::chrono::steady_clock::time_point last_{};
+};
+
+// ---------------------------------------------------------------------------
+// Command specifications
+//
+// Every option each command reads is listed here exactly once. The tables are
+// the single source of truth for three things that used to drift apart: the
+// help text, the strict unknown-option check, and the documented surface. An
+// option missing from a table is rejected at parse time, so adding a new
+// args.get() call without a table entry fails loudly instead of silently.
+// ---------------------------------------------------------------------------
+
+struct OptionSpec {
+    std::string_view flag;
+    std::string_view value_name; // empty for a boolean flag
+    std::string_view help;
+};
+
+struct OptionGroup {
+    std::string_view title;
+    std::span<const OptionSpec> options;
+};
+
+struct CommandSpec {
+    std::string_view name;
+    std::string_view synopsis;
+    std::string_view summary;
+    std::span<const OptionGroup> groups;
+};
+
+constexpr std::array<OptionSpec, 2> output_options{{
+    {"--format", "text|json", "output format (default text)"},
+    {"--help", "", "print this help and exit"},
+}};
+
+constexpr std::array<OptionSpec, 8> embedding_options{{
+    {"--embedder", "hash|llama", "embedding backend (default hash)"},
+    {"--model", "FILE", "GGUF model, required by --embedder llama"},
+    {"--hash-dim", "N", "hash backend dimension (default 256)"},
+    {"--ctx", "N", "llama context tokens (default 512)"},
+    {"--batch-tokens", "N", "llama batch tokens (default 2048)"},
+    {"--parallel", "N", "llama parallel sequences (default 8)"},
+    {"--threads", "N", "llama threads, 0 for the default (default 0)"},
+    {"--gpu-layers", "N", "llama GPU layers; part of the fingerprint "
+                          "(default 99)"},
+}};
+
+constexpr std::array<OptionSpec, 18> build_options{{
+    {"--docs", "FILE", "one document per line (required)"},
+    {"--index", "PREFIX", "writes PREFIX.leann and PREFIX.docs (required)"},
+    {"--embedding-cache", "FILE",
+     "LEANNBC2 cache bound to the exact --docs bytes; "
+     "requires --embedder cache"},
+    {"--graph-degree", "N", "hnswlib M (default 16)"},
+    {"--ef-construction", "N", "hnswlib build ef (default 100)"},
+    {"--low-degree", "N", "outgoing cap for non-hubs (default 3)"},
+    {"--hub-ratio", "F", "fraction of preserved hubs (default 0.02)"},
+    {"--approx", "pq|simhash", "approximate distance backend (default pq)"},
+    {"--pq-subquantizers", "N",
+     "PQ subspaces; must divide dimension (default 64)"},
+    {"--pq-bits", "N", "bits per PQ code, 1..8 (default 4)"},
+    {"--pq-iterations", "N", "Lloyd iterations (default 10)"},
+    {"--pq-training-samples", "N", "maximum training vectors (default 4096)"},
+    {"--sketch-bits", "N", "SimHash bits for --approx simhash (default 128)"},
+    {"--embedding-batch", "N", "build embedding batch (default 32)"},
+    {"--seed", "N", "deterministic build seed (default 42)"},
+    {"--progress", "auto|always|never",
+     "progress on stderr; auto means when stderr is a terminal "
+     "(default auto)"},
+    {"--format", "text|json", "output format (default text)"},
+    {"--help", "", "print this help and exit"},
+}};
+
+constexpr std::array<OptionSpec, 2> search_target_options{{
+    {"--index", "PREFIX", "artifact prefix to search (required)"},
+    {"--query", "TEXT", "query text (required)"},
+}};
+
+constexpr std::array<OptionSpec, 5> search_tuning_options{{
+    {"--top-k", "N", "results to return (default 3)"},
+    {"--ef-search", "N", "candidates recomputed exactly (default 64)"},
+    {"--recompute-batch", "N", "embedder batch during rerank (default 16)"},
+    {"--scan-limit", "N",
+     "flat ADC below N nodes; 0 forces the graph (default 100000)"},
+    {"--rerank-ratio", "F", "approximate shortlist ratio (default 0.25)"},
+}};
+
+constexpr std::array<OptionSpec, 1> stats_options{{
+    {"--index", "PREFIX", "artifact prefix to describe (required)"},
+}};
+
+constexpr std::array<OptionSpec, 18> bench_options{{
+    {"--index", "PREFIX", "artifact prefix to benchmark (required)"},
+    {"--queries", "FILE", "one query per line (required)"},
+    {"--ground-truth", "FILE", "precomputed LEANN_GT1 exact neighbour IDs"},
+    {"--ground-truth-cache", "FILE",
+     "reuse benchmark-only dense corpus embeddings"},
+    {"--ground-truth-batch", "N",
+     "corpus embedding batch while computing truth (default 64)"},
+    {"--query-embedding-cache", "FILE", "verified LEANNBC2 query vectors"},
+    {"--embedding-cache", "FILE",
+     "protected from being overwritten by an output path"},
+    {"--dense-baseline", "0|1", "build and measure dense HNSW (default 0)"},
+    {"--dense-m", "N", "dense baseline M (default 16)"},
+    {"--dense-ef-construction", "N",
+     "dense baseline build ef (default 100)"},
+    {"--dense-ef-search", "N",
+     "dense baseline query ef (defaults to --ef-search)"},
+    {"--warmup-queries", "N", "unmeasured prefix warmup (default 1)"},
+    {"--report-k", "N", "also report prefix recall; N <= --top-k"},
+    {"--raw-latencies", "FILE", "per-query CSV latency/candidate records"},
+    {"--max-queries", "N", "deterministic prefix; 0 means all (default 0)"},
+    {"--progress", "auto|always|never",
+     "progress on stderr; auto means when stderr is a terminal "
+     "(default auto)"},
+    {"--format", "text|json", "output format (default text)"},
+    {"--help", "", "print this help and exit"},
+}};
+
+constexpr std::array<OptionSpec, 5> doctor_options{{
+    {"--index", "PREFIX", "artifact prefix to inspect (required)"},
+    {"--repair", "",
+     "remove leftovers that are provably safe to remove; never a build lock"},
+    {"--force-unlock", "",
+     "also remove build locks; only when no build is running"},
+    {"--format", "text|json", "output format (default text)"},
+    {"--help", "", "print this help and exit"},
+}};
+
+constexpr std::array<OptionGroup, 2> build_groups{{
+    {"Build options", build_options},
+    {"Embedding options (build also accepts --embedder cache)",
+     embedding_options},
+}};
+
+constexpr std::array<OptionGroup, 4> search_groups{{
+    {"Search options", search_target_options},
+    {"Search tuning", search_tuning_options},
+    {"Embedding options", embedding_options},
+    {"Output options", output_options},
+}};
+
+constexpr std::array<OptionGroup, 2> stats_groups{{
+    {"Options", stats_options},
+    {"Output options", output_options},
+}};
+
+constexpr std::array<OptionGroup, 3> bench_groups{{
+    {"Benchmark options", bench_options},
+    {"Search tuning", search_tuning_options},
+    {"Embedding options", embedding_options},
+}};
+
+constexpr std::array<OptionGroup, 1> doctor_groups{{
+    {"Options", doctor_options},
+}};
+
+constexpr std::array<CommandSpec, 5> command_specs{{
+    {"build", "leann build --docs FILE --index PREFIX [options]",
+     "Embed a corpus, prune the graph, and publish the artifact pair.",
+     build_groups},
+    {"search", "leann search --index PREFIX --query TEXT [options]",
+     "Retrieve the exact top-k for one query.", search_groups},
+    {"stats", "leann stats --index PREFIX [options]",
+     "Describe a published artifact pair.", stats_groups},
+    {"bench", "leann bench --index PREFIX --queries FILE [options]",
+     "Measure recall, latency, and recomputation over a query file.",
+     bench_groups},
+    {"doctor", "leann doctor --index PREFIX [options]",
+     "Report artifact health and leftovers from an interrupted build.",
+     doctor_groups},
+}};
+
+[[nodiscard]] const CommandSpec * find_command(std::string_view name) {
+    const auto found = std::find_if(
+        command_specs.begin(), command_specs.end(),
+        [&](const CommandSpec & spec) { return spec.name == name; });
+    return found == command_specs.end() ? nullptr : &*found;
+}
+
+[[nodiscard]] const OptionSpec * find_option(const CommandSpec & command,
+                                             std::string_view flag) {
+    for (const OptionGroup & group : command.groups) {
+        for (const OptionSpec & option : group.options) {
+            if (option.flag == flag) {
+                return &option;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Bounded Levenshtein distance, used only to suggest a correction for a
+// mistyped option. Returns limit + 1 once the distance is known to exceed it.
+[[nodiscard]] std::size_t edit_distance(std::string_view lhs,
+                                        std::string_view rhs,
+                                        std::size_t limit) {
+    if (lhs.size() > rhs.size()) {
+        std::swap(lhs, rhs);
+    }
+    if (rhs.size() - lhs.size() > limit) {
+        return limit + 1;
+    }
+    std::vector<std::size_t> previous(lhs.size() + 1);
+    std::vector<std::size_t> current(lhs.size() + 1);
+    std::iota(previous.begin(), previous.end(), std::size_t{0});
+    for (std::size_t j = 1; j <= rhs.size(); ++j) {
+        current[0] = j;
+        std::size_t best = current[0];
+        for (std::size_t i = 1; i <= lhs.size(); ++i) {
+            const std::size_t substitution =
+                previous[i - 1] + (lhs[i - 1] == rhs[j - 1] ? 0U : 1U);
+            current[i] = std::min({current[i - 1] + 1, previous[i] + 1,
+                                   substitution});
+            best = std::min(best, current[i]);
+        }
+        if (best > limit) {
+            return limit + 1;
+        }
+        previous.swap(current);
+    }
+    return previous[lhs.size()];
+}
+
+// The nearest option of any command, so a flag offered to the wrong command
+// still gets a useful hint instead of a bare rejection.
+[[nodiscard]] std::string suggest_option(const CommandSpec & command,
+                                         std::string_view flag) {
+    std::string_view best;
+    std::size_t best_distance = 3; // reject suggestions that are not close
+    for (const OptionGroup & group : command.groups) {
+        for (const OptionSpec & option : group.options) {
+            const std::size_t distance =
+                edit_distance(flag, option.flag, best_distance);
+            if (distance < best_distance) {
+                best_distance = distance;
+                best = option.flag;
+            }
+        }
+    }
+    if (!best.empty()) {
+        return "; did you mean " + std::string(best) + "?";
+    }
+    for (const CommandSpec & other : command_specs) {
+        if (other.name == command.name) {
+            continue;
+        }
+        if (find_option(other, flag) != nullptr) {
+            return "; " + std::string(flag) + " belongs to leann " +
+                   std::string(other.name);
+        }
+    }
+    return {};
+}
+
+// Rejects anything the command does not read. Without this a mistyped option
+// is silently ignored and the command answers with its defaults, which reads
+// as a correct answer to a question that was never asked.
+void validate_arguments(const CommandSpec & command,
+                        const Arguments & arguments) {
+    const auto reject_unknown = [&](const std::string & flag) {
+        if (find_option(command, flag) == nullptr) {
+            throw std::invalid_argument(
+                "unknown option for leann " + std::string(command.name) +
+                ": " + flag + suggest_option(command, flag));
+        }
+    };
+    for (const auto & [flag, value] : arguments.values()) {
+        reject_unknown(flag);
+        (void)value;
+    }
+    for (const std::string & flag : arguments.flags()) {
+        reject_unknown(flag);
+    }
+    for (const std::string & flag : arguments.valueless()) {
+        reject_unknown(flag);
+        throw std::invalid_argument("missing value for " + flag);
+    }
+    if (!arguments.positional().empty()) {
+        throw std::invalid_argument(
+            "unexpected argument for leann " + std::string(command.name) +
+            ": " + arguments.positional().front());
+    }
+}
+
+void print_command_help(std::ostream & output, const CommandSpec & command) {
+    output << command.summary << "\n\nUsage:\n  " << command.synopsis << '\n';
+    std::size_t width = 0;
+    for (const OptionGroup & group : command.groups) {
+        for (const OptionSpec & option : group.options) {
+            const std::size_t length =
+                option.flag.size() +
+                (option.value_name.empty() ? 0U : option.value_name.size() + 1U);
+            width = std::max(width, length);
+        }
+    }
+    for (const OptionGroup & group : command.groups) {
+        output << '\n' << group.title << ":\n";
+        for (const OptionSpec & option : group.options) {
+            std::string term(option.flag);
+            if (!option.value_name.empty()) {
+                term += ' ';
+                term += option.value_name;
+            }
+            output << "  " << std::left << std::setw(static_cast<int>(width))
+                   << term << std::right << "  " << option.help << '\n';
+        }
+    }
+}
+
+[[nodiscard]] std::string suggest_command(std::string_view name) {
+    std::string_view best;
+    std::size_t best_distance = 3;
+    for (const CommandSpec & command : command_specs) {
+        const std::size_t distance =
+            edit_distance(name, command.name, best_distance);
+        if (distance < best_distance) {
+            best_distance = distance;
+            best = command.name;
+        }
+    }
+    if (best.empty()) {
+        return "; run leann --help for the command list";
+    }
+    return "; did you mean leann " + std::string(best) + "?";
+}
+
+void print_usage(std::ostream & output) {
+    output << "leann.cpp " << LEANN_VERSION_STRING
+           << " — native low-storage vector search\n\nUsage:\n";
+    std::size_t width = 0;
+    for (const CommandSpec & command : command_specs) {
+        width = std::max(width, command.name.size());
+    }
+    for (const CommandSpec & command : command_specs) {
+        output << "  leann " << std::left << std::setw(static_cast<int>(width))
+               << command.name << std::right << "  " << command.summary
+               << '\n';
+    }
+    output << "\n  leann <command> --help   options for one command\n"
+           << "  leann --version          print the version and exit\n";
+}
+
+void command_build(const Arguments & args,
+                   CancellationToken cancellation = {}) {
+    const auto format = output_format(args);
     const auto prefix = std::filesystem::path(args.require("--index"));
     const auto index_path = leann::index_file_from_prefix(prefix);
     const auto documents_path = leann::documents_file_from_prefix(prefix);
@@ -987,6 +1824,14 @@ void command_build(const Arguments & args) {
         args.unsigned_value("--embedding-batch", config.embedding_batch_size);
     config.random_seed = args.unsigned_value("--seed", config.random_seed);
 
+    ProgressReporter progress(args, "--progress");
+    if (progress.enabled()) {
+        config.report_progress = [&progress](const leann::BuildProgress & p) {
+            progress.report(p.stage, p.completed, p.total);
+        };
+    }
+    config.should_cancel = cancellation.predicate();
+
     const auto started = std::chrono::steady_clock::now();
     leann::Index::build(index_path, documents_path, documents, *embedder, config);
     if (cache_embedder != nullptr) {
@@ -996,21 +1841,46 @@ void command_build(const Arguments & args) {
         std::chrono::duration<double>(
             std::chrono::steady_clock::now() - started)
             .count();
+    progress.finish();
     const auto index = leann::Index::load(index_path);
     const auto stats = index.stats();
+    const auto documents_bytes =
+        static_cast<std::uint64_t>(std::filesystem::file_size(documents_path));
+
+    if (format == OutputFormat::Json) {
+        JsonDocument document(std::cout);
+        JsonWriter & json = document.writer();
+        json.begin_object();
+        json.field("nodes", stats.nodes);
+        json.field("edges", stats.edges);
+        json.field("build_seconds", elapsed, 3);
+        json.field("approximation", stats.approximation);
+        json.field("index_path", index_path.string());
+        json.field("index_bytes", stats.serialized_bytes);
+        json.field("documents_path", documents_path.string());
+        json.field("documents_bytes", documents_bytes);
+        json.field("dense_vector_bytes_avoided",
+                   stats.dense_vector_bytes_avoided);
+        json.field("pair_identity", stats.pair_identity);
+        json.field("embedder", stats.embedder_fingerprint);
+        json.end_object();
+        document.commit();
+        return;
+    }
     std::cout << "built " << stats.nodes << " nodes, " << stats.edges
               << " directed edges in " << std::fixed << std::setprecision(3)
               << elapsed << " s\n"
               << "approximation: " << stats.approximation << '\n'
-              << "index: " << index_path << " (" << stats.serialized_bytes
-              << " bytes)\n"
-              << "documents: " << documents_path << " ("
-              << std::filesystem::file_size(documents_path) << " bytes)\n"
+              << "index: " << index_path.string() << " ("
+              << stats.serialized_bytes << " bytes)\n"
+              << "documents: " << documents_path.string() << " ("
+              << documents_bytes << " bytes)\n"
               << "dense vectors not persisted: "
               << stats.dense_vector_bytes_avoided << " bytes\n";
 }
 
 void command_search(const Arguments & args) {
+    const auto format = output_format(args);
     const auto prefix = std::filesystem::path(args.require("--index"));
     const auto index_path = leann::index_file_from_prefix(prefix);
     auto index = leann::Index::load(index_path);
@@ -1018,9 +1888,40 @@ void command_search(const Arguments & args) {
         leann::DocumentStore::open(leann::documents_file_from_prefix(prefix));
     index.validate_document_store(documents);
     auto embedder = make_embedder(args);
+    const std::string query = args.require("--query");
     const auto response =
-        index.search(args.require("--query"), *embedder, documents,
-                     search_config(args));
+        index.search(query, *embedder, documents, search_config(args));
+
+    if (format == OutputFormat::Json) {
+        // Everything on stdout as one object: the point of the JSON mode is a
+        // single document a caller can parse without also reading stderr.
+        JsonDocument document(std::cout);
+        JsonWriter & json = document.writer();
+        json.begin_object();
+        json.field("query", query);
+        json.begin_array("results");
+        for (const auto & result : response.results) {
+            json.begin_element();
+            json.field("id", static_cast<std::uint64_t>(result.id));
+            json.field("distance", static_cast<double>(result.distance), 6);
+            json.field("document", documents.read(result.id));
+            json.end_object();
+        }
+        json.end_array();
+        json.begin_object_field("metrics");
+        json.field("search_ms", response.metrics.elapsed_ms, 3);
+        json.field("exact_recomputations",
+                   response.metrics.exact_recomputations);
+        json.field("approximate_distances",
+                   response.metrics.approximate_distances);
+        json.field("expanded_nodes", response.metrics.expanded_nodes);
+        json.field("upper_layer_hops", response.metrics.upper_layer_hops);
+        json.field("embedding_batches", response.metrics.embedding_batches);
+        json.end_object();
+        json.end_object();
+        document.commit();
+        return;
+    }
 
     for (const auto & result : response.results) {
         std::cout << result.id << '\t' << std::fixed << std::setprecision(6)
@@ -1038,6 +1939,7 @@ void command_search(const Arguments & args) {
 }
 
 void command_stats(const Arguments & args) {
+    const auto format = output_format(args);
     const auto prefix = std::filesystem::path(args.require("--index"));
     const auto index_path = leann::index_file_from_prefix(prefix);
     const auto index = leann::Index::load(index_path);
@@ -1050,6 +1952,37 @@ void command_stats(const Arguments & args) {
             ? 0.0
             : 100.0 * static_cast<double>(stats.serialized_bytes) /
                   static_cast<double>(documents.raw_bytes());
+
+    if (format == OutputFormat::Json) {
+        // Same keys as the text form, in the same order.
+        JsonDocument document(std::cout);
+        JsonWriter & json = document.writer();
+        json.begin_object();
+        json.field("nodes", stats.nodes);
+        json.field("edges", stats.edges);
+        json.field("upper_edges", stats.upper_edges);
+        json.field("max_level", static_cast<std::uint64_t>(stats.max_level));
+        json.field("dimension", static_cast<std::uint64_t>(stats.dimension));
+        json.field("approximation", stats.approximation);
+        json.field("sketch_bits",
+                   static_cast<std::uint64_t>(stats.sketch_bits));
+        json.field("approximation_code_bytes", stats.approximation_code_bytes);
+        json.field("approximation_codebook_bytes",
+                   stats.approximation_codebook_bytes);
+        json.field("max_degree", static_cast<std::uint64_t>(stats.max_degree));
+        json.field("entry_point",
+                   static_cast<std::uint64_t>(stats.entry_point));
+        json.field("index_bytes", stats.serialized_bytes);
+        json.field("raw_document_bytes", documents.raw_bytes());
+        json.field("index_over_raw_percent", overhead, 3);
+        json.field("dense_vector_bytes_avoided",
+                   stats.dense_vector_bytes_avoided);
+        json.field("pair_identity", stats.pair_identity);
+        json.field("embedder", stats.embedder_fingerprint);
+        json.end_object();
+        document.commit();
+        return;
+    }
 
     std::cout << "nodes=" << stats.nodes << '\n'
               << "edges=" << stats.edges << '\n'
@@ -1072,6 +2005,363 @@ void command_stats(const Arguments & args) {
               << stats.dense_vector_bytes_avoided << '\n'
               << "pair_identity=" << stats.pair_identity << '\n'
               << "embedder=" << stats.embedder_fingerprint << '\n';
+}
+
+// ---------------------------------------------------------------------------
+// doctor
+//
+// Reports what is actually on disk next to an artifact prefix and, on request,
+// removes only what it can prove is safe to remove. Three facts shape it:
+//
+//   * A build lock carries no proof of liveness. A descriptor is written
+//     inside it, but a pid can be recycled and a shared filesystem can be
+//     mounted on another host, so liveness is a probe and is reported as such.
+//     --repair never removes a lock; that needs the explicit --force-unlock.
+//   * A `.bak.*` index can be the only surviving index. When a publication
+//     rolls back and the document restore fails, the previous index is
+//     deliberately left in its backup rather than reactivated against the
+//     wrong chunks. So a backup is removable only once the live pair itself
+//     loads and validates.
+//   * A `.tmp.*` file is an abandoned build's scratch artifact, but only when
+//     no lock is present for the same target; otherwise a build may be
+//     writing it right now.
+// ---------------------------------------------------------------------------
+
+enum class LeftoverKind {
+    Temporary,
+    Backup,
+};
+
+struct Leftover {
+    LeftoverKind kind;
+    std::filesystem::path path;
+    std::uint64_t bytes = 0;
+};
+
+struct LockReport {
+    std::filesystem::path path;
+    bool present = false;
+    std::optional<leann::detail::LockOwner> owner;
+    leann::detail::OwnerLiveness liveness =
+        leann::detail::OwnerLiveness::Unknown;
+};
+
+struct DoctorReport {
+    std::filesystem::path index_path;
+    std::filesystem::path documents_path;
+    bool index_present = false;
+    bool documents_present = false;
+    bool pair_valid = false;
+    std::string pair_error;
+    std::string pair_identity;
+    std::vector<LockReport> locks;
+    std::vector<Leftover> leftovers;
+    std::vector<std::string> removed;
+    std::vector<std::string> retained;
+};
+
+[[nodiscard]] std::string_view
+liveness_text(leann::detail::OwnerLiveness liveness) {
+    switch (liveness) {
+    case leann::detail::OwnerLiveness::Running:
+        return "running";
+    case leann::detail::OwnerLiveness::Absent:
+        return "absent";
+    case leann::detail::OwnerLiveness::Unknown:
+        break;
+    }
+    return "unknown";
+}
+
+[[nodiscard]] LockReport inspect_lock(const std::filesystem::path & target) {
+    LockReport report;
+    report.path = leann::detail::lock_path_for(target);
+    std::error_code error;
+    report.present = std::filesystem::is_directory(report.path, error);
+    if (!report.present) {
+        return report;
+    }
+    report.owner = leann::detail::read_lock_owner(report.path);
+    report.liveness = leann::detail::owner_liveness(report.owner);
+    return report;
+}
+
+// Scans the prefix's directory for artifacts adjacent to either member of the
+// pair. Matching is on the "<name>.tmp." / "<name>.bak." prefixes the builder
+// actually produces, not on a trailing extension.
+[[nodiscard]] std::vector<Leftover>
+collect_leftovers(const std::filesystem::path & index_path,
+                  const std::filesystem::path & documents_path) {
+    std::vector<Leftover> leftovers;
+    auto directory = index_path.parent_path();
+    if (directory.empty()) {
+        directory = std::filesystem::path(".");
+    }
+    std::error_code error;
+    if (!std::filesystem::is_directory(directory, error)) {
+        return leftovers;
+    }
+    const std::array<std::string, 2> stems{
+        index_path.filename().string(),
+        documents_path.filename().string(),
+    };
+    // An unreadable directory must not be reported as "no leftovers"; that
+    // would be a clean bill of health the tool has no basis for.
+    std::filesystem::directory_iterator entries(directory, error);
+    if (error) {
+        throw std::runtime_error("cannot scan '" + directory.string() +
+                                 "' for build leftovers: " + error.message());
+    }
+    for (const auto & entry : entries) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        for (const std::string & stem : stems) {
+            const bool temporary = name.starts_with(stem + ".tmp.");
+            const bool backup = name.starts_with(stem + ".bak.");
+            if (!temporary && !backup) {
+                continue;
+            }
+            std::error_code size_error;
+            const auto size = std::filesystem::file_size(entry.path(),
+                                                         size_error);
+            leftovers.push_back(
+                {temporary ? LeftoverKind::Temporary : LeftoverKind::Backup,
+                 entry.path(),
+                 size_error ? 0U : static_cast<std::uint64_t>(size)});
+            break;
+        }
+    }
+    std::sort(leftovers.begin(), leftovers.end(),
+              [](const Leftover & lhs, const Leftover & rhs) {
+                  return lhs.path.string() < rhs.path.string();
+              });
+    return leftovers;
+}
+
+void command_doctor(const Arguments & args) {
+    const auto format = output_format(args);
+    const bool repair = args.has("--repair");
+    const bool force_unlock = args.has("--force-unlock");
+    const auto prefix = std::filesystem::path(args.require("--index"));
+
+    DoctorReport report;
+    report.index_path = leann::index_file_from_prefix(prefix);
+    report.documents_path = leann::documents_file_from_prefix(prefix);
+
+    std::error_code error;
+    report.index_present =
+        std::filesystem::is_regular_file(report.index_path, error);
+    report.documents_present =
+        std::filesystem::is_regular_file(report.documents_path, error);
+
+    // The pair check is the whole basis for deciding a backup is disposable,
+    // so it is the full load path: checksum, open, and cross-validate.
+    if (report.index_present && report.documents_present) {
+        try {
+            const auto index = leann::Index::load(report.index_path);
+            auto documents =
+                leann::DocumentStore::open(report.documents_path);
+            index.validate_document_store(documents);
+            report.pair_valid = true;
+            report.pair_identity = index.stats().pair_identity;
+        } catch (const std::exception & failure) {
+            report.pair_error = failure.what();
+        }
+    } else if (report.index_present != report.documents_present) {
+        report.pair_error =
+            report.index_present
+                ? "document store is missing; the index alone cannot be used"
+                : "index is missing; a build may have been interrupted before "
+                  "its commit";
+    } else {
+        report.pair_error = "no artifact pair at this prefix";
+    }
+
+    report.locks.push_back(inspect_lock(report.index_path));
+    report.locks.push_back(inspect_lock(report.documents_path));
+    report.leftovers =
+        collect_leftovers(report.index_path, report.documents_path);
+
+    const bool any_lock_present =
+        std::ranges::any_of(report.locks,
+                            [](const LockReport & lock) {
+                                return lock.present;
+                            });
+    const bool any_owner_running = std::ranges::any_of(
+        report.locks, [](const LockReport & lock) {
+            return lock.present &&
+                   lock.liveness == leann::detail::OwnerLiveness::Running;
+        });
+
+    const auto remove_path = [&](const std::filesystem::path & path,
+                                 const std::string & reason) {
+        std::error_code remove_error;
+        std::filesystem::remove(path, remove_error);
+        if (remove_error) {
+            report.retained.push_back(path.string() + ": " +
+                                      remove_error.message());
+        } else {
+            report.removed.push_back(path.string() + " (" + reason + ")");
+        }
+    };
+
+    // Every precondition that can refuse the request is checked before
+    // anything is deleted, so no removal can be performed and then discarded
+    // by a later throw that prevents the report from being printed.
+    if (force_unlock && any_owner_running) {
+        throw std::runtime_error(
+            "refusing --force-unlock: a lock names a process that is "
+            "running on this host");
+    }
+
+    if (repair) {
+        for (const Leftover & leftover : report.leftovers) {
+            // A lock means a build may be mid-transaction. Its temporaries
+            // are still being written, and — because publish_artifact_pair
+            // parks the previous pair in .bak.* for the whole transaction and
+            // restores from exactly those files on rollback — its backups are
+            // load-bearing. Neither is ours to remove, whatever the live pair
+            // looked like a moment ago.
+            if (any_lock_present) {
+                report.retained.push_back(
+                    leftover.path.string() +
+                    ": a build lock is present, so a build may still be "
+                    "using this file");
+                continue;
+            }
+            if (leftover.kind == LeftoverKind::Temporary) {
+                remove_path(leftover.path, "abandoned build temporary");
+            } else {
+                if (!report.pair_valid) {
+                    report.retained.push_back(
+                        leftover.path.string() +
+                        ": the live pair does not validate, so this backup "
+                        "may be the only usable artifact");
+                    continue;
+                }
+                remove_path(leftover.path,
+                            "superseded backup; live pair validates");
+            }
+        }
+    }
+
+    if (force_unlock) {
+        for (const LockReport & lock : report.locks) {
+            if (!lock.present) {
+                continue;
+            }
+            leann::detail::remove_lock_owner(lock.path);
+            remove_path(lock.path, "build lock removed by --force-unlock");
+        }
+    }
+
+    if (format == OutputFormat::Json) {
+        JsonDocument document(std::cout);
+        JsonWriter & json = document.writer();
+        json.begin_object();
+        json.field("index_path", report.index_path.string());
+        json.field("documents_path", report.documents_path.string());
+        json.field("index_present", report.index_present);
+        json.field("documents_present", report.documents_present);
+        json.field("pair_valid", report.pair_valid);
+        json.field("pair_identity", report.pair_identity);
+        json.field("pair_error", report.pair_error);
+        json.begin_array("locks");
+        for (const LockReport & lock : report.locks) {
+            json.begin_element();
+            json.field("path", lock.path.string());
+            json.field("present", lock.present);
+            json.field("owner_pid",
+                       lock.owner ? lock.owner->pid : std::uint64_t{0});
+            json.field("owner_host", lock.owner ? lock.owner->host : "");
+            json.field("owner_started_unix",
+                       lock.owner ? lock.owner->started_unix
+                                  : std::uint64_t{0});
+            json.field("owner_liveness", liveness_text(lock.liveness));
+            json.end_object();
+        }
+        json.end_array();
+        json.begin_array("leftovers");
+        for (const Leftover & leftover : report.leftovers) {
+            json.begin_element();
+            json.field("path", leftover.path.string());
+            json.field("kind", leftover.kind == LeftoverKind::Temporary
+                                   ? "temporary"
+                                   : "backup");
+            json.field("bytes", leftover.bytes);
+            json.end_object();
+        }
+        json.end_array();
+        json.begin_array("removed");
+        for (const std::string & entry : report.removed) {
+            json.begin_element();
+            json.field("detail", entry);
+            json.end_object();
+        }
+        json.end_array();
+        json.begin_array("retained");
+        for (const std::string & entry : report.retained) {
+            json.begin_element();
+            json.field("detail", entry);
+            json.end_object();
+        }
+        json.end_array();
+        json.end_object();
+        document.commit();
+        return;
+    }
+
+    std::cout << "index: " << report.index_path.string() << " ("
+              << (report.index_present ? "present" : "missing") << ")\n"
+              << "documents: " << report.documents_path.string() << " ("
+              << (report.documents_present ? "present" : "missing") << ")\n"
+              << "pair: " << (report.pair_valid ? "valid" : "unusable");
+    if (!report.pair_valid) {
+        std::cout << " — " << report.pair_error;
+    } else {
+        std::cout << " (identity " << report.pair_identity << ")";
+    }
+    std::cout << '\n';
+
+    for (const LockReport & lock : report.locks) {
+        if (!lock.present) {
+            continue;
+        }
+        std::cout << "lock: " << lock.path.string() << " held by ";
+        if (lock.owner) {
+            std::cout << "pid " << lock.owner->pid << " on host "
+                      << (lock.owner->host.empty() ? "?" : lock.owner->host)
+                      << ", owner " << liveness_text(lock.liveness);
+        } else {
+            std::cout << "an unrecorded owner, liveness unknown";
+        }
+        std::cout << '\n';
+    }
+    if (!any_lock_present) {
+        std::cout << "lock: none\n";
+    }
+
+    for (const Leftover & leftover : report.leftovers) {
+        std::cout << (leftover.kind == LeftoverKind::Temporary ? "temporary: "
+                                                               : "backup: ")
+                  << leftover.path.string() << " (" << leftover.bytes
+                  << " bytes)\n";
+    }
+    if (report.leftovers.empty()) {
+        std::cout << "leftovers: none\n";
+    }
+    for (const std::string & entry : report.removed) {
+        std::cout << "removed: " << entry << '\n';
+    }
+    for (const std::string & entry : report.retained) {
+        std::cout << "retained: " << entry << '\n';
+    }
+    if (!repair && !report.leftovers.empty()) {
+        std::cout << "hint: rerun with --repair to remove what is provably "
+                     "safe to remove\n";
+    }
 }
 
 std::vector<std::uint32_t>
@@ -1279,7 +2569,13 @@ void write_raw_benchmark_rows(
     }
 }
 
-void command_bench(const Arguments & args) {
+void command_bench(const Arguments & args,
+                   CancellationToken cancellation = {}) {
+    // Constructed up front, not at the query loop: it validates --progress,
+    // and a benchmark can spend an hour computing ground truth before it ever
+    // reaches the loop. A typo there should cost a second, not the run.
+    ProgressReporter progress(args, "--progress");
+    const auto format = output_format(args);
     const auto prefix = std::filesystem::path(args.require("--index"));
     const auto index_path = leann::index_file_from_prefix(prefix);
     const auto documents_path =
@@ -1547,6 +2843,8 @@ void command_bench(const Arguments & args) {
         args.unsigned_value("--warmup-queries", 1), queries.size());
     for (std::size_t query_index = 0; query_index < warmup_queries;
          ++query_index) {
+        cancellation.throw_if_requested("benchmark warmup");
+        progress.report("warmup", query_index, warmup_queries);
         const auto embedded_query = embed_query(query_index);
         (void)index.search_embedding(
             embedded_query, *embedder, documents, config);
@@ -1576,6 +2874,10 @@ void command_bench(const Arguments & args) {
 
     for (std::size_t query_index = 0; query_index < queries.size();
          ++query_index) {
+        // Between queries only: an interrupt must not truncate a measured
+        // query and then report the partial result as a benchmark.
+        cancellation.throw_if_requested("benchmark");
+        progress.report("querying", query_index, queries.size());
         const auto embedded_query = embed_query(query_index);
         std::vector<std::uint32_t> computed_truth;
         std::span<const std::uint32_t> truth;
@@ -1697,6 +2999,7 @@ void command_bench(const Arguments & args) {
                 });
         }
     }
+    progress.finish();
     if (raw_output) {
         write_raw_benchmark_rows(
             raw_output->stream(), raw_rows, report_k);
@@ -1706,6 +3009,56 @@ void command_bench(const Arguments & args) {
     }
 
     const double count = static_cast<double>(queries.size());
+    const double latency_mean =
+        std::accumulate(latencies.begin(), latencies.end(), 0.0) / count;
+    const std::string recall_key =
+        "recall_at_" + std::to_string(config.top_k);
+    const double dense_latency_mean =
+        dense_latencies.empty()
+            ? 0.0
+            : std::accumulate(dense_latencies.begin(), dense_latencies.end(),
+                              0.0) /
+                  count;
+
+    if (format == OutputFormat::Json) {
+        // Same keys as the text form, including the top-k-dependent recall
+        // key names, so a consumer can switch formats without remapping.
+        JsonDocument document(std::cout);
+        JsonWriter & json = document.writer();
+        json.begin_object();
+        json.field("queries", static_cast<std::uint64_t>(queries.size()));
+        json.field("warmup_queries",
+                   static_cast<std::uint64_t>(warmup_queries));
+        json.field(recall_key, recall_sum / count, 6);
+        if (report_k) {
+            json.field("recall_at_" + std::to_string(*report_k),
+                       report_recall_sum / count, 6);
+        }
+        json.field("latency_ms_mean", latency_mean, 6);
+        json.field("latency_ms_p50", percentile(latencies, 0.50), 6);
+        json.field("latency_ms_p95", percentile(latencies, 0.95), 6);
+        json.field("exact_recomputations_mean",
+                   static_cast<double>(exact_sum) / count, 6);
+        json.field("approximate_distances_mean",
+                   static_cast<double>(approximate_sum) / count, 6);
+        json.field("upper_layer_hops_mean",
+                   static_cast<double>(upper_hops_sum) / count, 6);
+        if (dense_index) {
+            json.field("dense_hnsw_" + recall_key, dense_recall_sum / count,
+                       6);
+            json.field("dense_hnsw_latency_ms_mean", dense_latency_mean, 6);
+            json.field("dense_hnsw_latency_ms_p50",
+                       percentile(dense_latencies, 0.50), 6);
+            json.field("dense_hnsw_latency_ms_p95",
+                       percentile(dense_latencies, 0.95), 6);
+            json.field("dense_hnsw_build_seconds", dense_build_seconds, 6);
+            json.field("dense_hnsw_index_bytes", dense_index_bytes);
+        }
+        json.end_object();
+        document.commit();
+        return;
+    }
+
     std::cout << "queries=" << queries.size() << '\n'
               << "warmup_queries=" << warmup_queries << '\n'
               << "recall_at_" << config.top_k << '=' << std::fixed
@@ -1714,10 +3067,7 @@ void command_bench(const Arguments & args) {
         std::cout << "recall_at_" << *report_k << '='
                   << report_recall_sum / count << '\n';
     }
-    std::cout << "latency_ms_mean="
-              << std::accumulate(latencies.begin(), latencies.end(), 0.0) /
-                     count
-              << '\n'
+    std::cout << "latency_ms_mean=" << latency_mean << '\n'
               << "latency_ms_p50=" << percentile(latencies, 0.50) << '\n'
               << "latency_ms_p95=" << percentile(latencies, 0.95) << '\n'
               << "exact_recomputations_mean=" << exact_sum / count << '\n'
@@ -1727,10 +3077,7 @@ void command_bench(const Arguments & args) {
     if (dense_index) {
         std::cout << "dense_hnsw_recall_at_" << config.top_k << '='
                   << dense_recall_sum / count << '\n'
-                  << "dense_hnsw_latency_ms_mean="
-                  << std::accumulate(dense_latencies.begin(),
-                                     dense_latencies.end(), 0.0) /
-                         count
+                  << "dense_hnsw_latency_ms_mean=" << dense_latency_mean
                   << '\n'
                   << "dense_hnsw_latency_ms_p50="
                   << percentile(dense_latencies, 0.50) << '\n'
@@ -1749,24 +3096,72 @@ int main(int argc, char ** argv) {
             print_usage(std::cerr);
             return 2;
         }
+        // --version and --help are handled before Arguments because option
+        // parsing starts at argv[2]; in argv[1] they name the request itself.
         const std::string command = argv[1];
-        const Arguments args(argc, argv);
-        if (command == "help" || args.has("--help")) {
+        if (command == "--version" || command == "-V" ||
+            command == "version") {
+            std::cout << "leann.cpp " << LEANN_VERSION_STRING << '\n';
+            return 0;
+        }
+        if (command == "help" || command == "--help" || command == "-h") {
+            if (argc >= 3) {
+                const CommandSpec * requested = find_command(argv[2]);
+                if (requested == nullptr) {
+                    throw std::invalid_argument(
+                        "unknown command: " + std::string(argv[2]) +
+                        suggest_command(argv[2]));
+                }
+                print_command_help(std::cout, *requested);
+                return 0;
+            }
             print_usage(std::cout);
             return 0;
         }
+
+        const CommandSpec * spec = find_command(command);
+        if (spec == nullptr) {
+            throw std::invalid_argument("unknown command: " + command +
+                                        suggest_command(command));
+        }
+        const Arguments args(argc, argv);
+        if (args.has("--help")) {
+            print_command_help(std::cout, *spec);
+            return 0;
+        }
+        validate_arguments(*spec, args);
+
+        // Handlers are installed only for the commands that actually poll for
+        // cancellation, and only inside main. Installing them for every
+        // command would leave search, stats, and doctor catching a signal
+        // that nothing acts on, making them silently uninterruptible; and
+        // installing them at namespace scope would take over the signal
+        // handling of any test binary that includes this file.
+        const auto install_handlers = [] {
+            std::signal(SIGINT, handle_interrupt);
+            std::signal(SIGTERM, handle_interrupt);
+            return CancellationToken(&interrupt_requested);
+        };
+
         if (command == "build") {
-            command_build(args);
+            command_build(args, install_handlers());
         } else if (command == "search") {
             command_search(args);
         } else if (command == "stats") {
             command_stats(args);
         } else if (command == "bench") {
-            command_bench(args);
+            command_bench(args, install_handlers());
+        } else if (command == "doctor") {
+            command_doctor(args);
         } else {
             throw std::invalid_argument("unknown command: " + command);
         }
         return 0;
+    } catch (const leann::BuildCancelled & cancelled) {
+        // 130 is the conventional shell status for a SIGINT-terminated
+        // command, which is what the interrupt handler translates into here.
+        std::cerr << "cancelled: " << cancelled.what() << '\n';
+        return 130;
     } catch (const std::exception & error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;

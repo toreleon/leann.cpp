@@ -8,9 +8,11 @@ embeddings in batches with a GGUF model through a pinned llama.cpp/ggml C API.
 This repository is an independent LEANN-style implementation, not an
 accuracy-compatible port of official LEANN. Official LEANN has a Python
 control plane and a custom FAISS C++ data plane; this project targets a
-zero-Python, single-process C++/ggml deployment. The current `v0.3` development
-line adds fail-closed artifact integrity to the measured `v0.2` retrieval
-spike:
+zero-Python, single-process C++/ggml deployment. The `v0.3` development line
+added fail-closed artifact integrity to the measured `v0.2` retrieval spike,
+and the current `v0.4` line makes the tool operable: strict option handling,
+structured output, cancellable builds, and artifact recovery. The question
+underneath has not changed:
 
 > Can a llama.cpp embedding model traverse a compact graph by selectively
 > recomputing document embeddings, and what recall/latency/storage trade-off
@@ -49,8 +51,13 @@ Reproduce it with the [hash-backend quick start](#quick-start) below.
 - A versioned, dependency-free C11 read/search API with opaque handles,
   caller-owned batched embedding callbacks, owned result bytes, and
   thread-local errors.
-- `build`, `search`, `stats`, and exact-ground-truth `bench` commands, including
-  a same-embedding dense HNSW baseline.
+- `build`, `search`, `stats`, exact-ground-truth `bench`, and `doctor`
+  commands, including a same-embedding dense HNSW baseline.
+- Strict per-command option validation with correction hints, per-command
+  help, and opt-in `--format json` on every command. See
+  [the CLI guide](docs/CLI.md).
+- Cancellable builds: SIGINT unwinds without publishing and without leaking
+  locks or temporaries, and exits 130.
 - Reproducible BEIR SciFact preparation and parameter-sweep scripts.
 - Deterministic hash embedder for fast development and CI.
 
@@ -136,6 +143,23 @@ Use the hash backend to exercise the complete pipeline without a model:
   --embedder hash \
   --hash-dim 256
 ```
+
+`leann --help` lists the commands, `leann <command> --help` prints one
+command's options, and `leann --version` prints the version. An option a
+command does not read is an error rather than a silently ignored token:
+
+```console
+$ leann search --index out/demo-hash --query cat --topk 2
+error: unknown option for leann search: --topk; did you mean --top-k?
+```
+
+Add `--format json` to any command for a single machine-readable object on
+stdout; the default text output is unchanged. Long builds accept
+`--progress auto|always|never` and are cancellable with Ctrl-C, which
+publishes nothing and leaves no temporaries behind. After an interrupted or
+failed build, `leann doctor --index PREFIX` reports what is on disk and
+`--repair` removes what is provably safe to remove. The details, including
+what `doctor` deliberately refuses to do, are in [the CLI guide](docs/CLI.md).
 
 ## Embed with the C API
 

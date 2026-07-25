@@ -29,6 +29,8 @@ from run_large_scale_benchmark import (  # noqa: E402
     exact_topk_block,
     generate_cache,
     generate_ground_truth,
+    is_build_residue,
+    prefix_artifacts,
     run_repeated_stage,
 )
 from openai_embedding_proxy import Metrics as ProxyMetrics  # noqa: E402
@@ -210,6 +212,32 @@ class BenchmarkToolsTest(unittest.TestCase):
             documents.write_text("alpha\nzeta\nalpha\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "SHA-256"):
                 validate_cache_source(cache_metadata, documents)
+
+    def test_build_residue_is_excluded_from_stage_artifacts(self) -> None:
+        # Index::build appends a random token, so the residue names end in the
+        # token rather than in ".tmp"/".bak". A stage that counted them would
+        # see its own checkpoint as changed after an interrupted build.
+        self.assertTrue(is_build_residue("big.leann.tmp.6a17d62f59cd98dc"))
+        self.assertTrue(is_build_residue("big.docs.bak.0f1e2d3c4b5a6978"))
+        self.assertTrue(is_build_residue("legacy.leann.tmp"))
+        self.assertFalse(is_build_residue("big.leann"))
+        self.assertFalse(is_build_residue("big.docs"))
+
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            prefix = directory / "big"
+            for name in ("big.leann", "big.docs"):
+                (directory / name).write_bytes(b"artifact")
+            for name in (
+                "big.leann.tmp.6a17d62f59cd98dc",
+                "big.docs.tmp.6a17d62f59cd98dc",
+                "big.leann.bak.0f1e2d3c4b5a6978",
+            ):
+                (directory / name).write_bytes(b"residue")
+            (directory / "big.leann.lock").mkdir()
+
+            artifacts = sorted(path.name for path in prefix_artifacts(prefix))
+            self.assertEqual(artifacts, ["big.docs", "big.leann"])
 
     def test_tie_stable_topk(self) -> None:
         corpus = np.array([[1, 0], [1, 0], [0, 1]], dtype=np.float32)

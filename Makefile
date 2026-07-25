@@ -10,11 +10,13 @@ CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Wpedantic
 LDLIBS := -pthread
 
-CORE_SOURCES := src/artifact_publisher.cpp src/c_api.cpp src/checksum.cpp \
+CORE_SOURCES := src/artifact_publisher.cpp src/build_lock.cpp src/c_api.cpp \
+	src/checksum.cpp \
 	src/document_store.cpp src/embedder.cpp src/index.cpp src/product_quantizer.cpp
 CORE_OBJECTS := $(CORE_SOURCES:%.cpp=$(BUILD_DIR)/%.o)
 
-.PHONY: all test persistence-test core-safety-test c-api-test clean check-hnsw
+.PHONY: all test persistence-test core-safety-test c-api-test cli-cache-test \
+	check clean check-hnsw
 
 all: check-hnsw $(BUILD_DIR)/leann
 
@@ -66,6 +68,19 @@ $(BUILD_DIR)/leann_c_header_tests: $(CORE_OBJECTS) \
 	$(BUILD_DIR)/tests/test_c_header.o
 	$(CXX) $^ $(LDLIBS) -o $@
 
+# tests/test_cli_cache.cpp #includes app/main.cpp with main renamed, so this
+# target must not also link $(BUILD_DIR)/app/main.o.
+cli-cache-test: check-hnsw $(BUILD_DIR)/leann_cli_cache_tests
+	$(BUILD_DIR)/leann_cli_cache_tests
+
+$(BUILD_DIR)/leann_cli_cache_tests: $(CORE_OBJECTS) \
+	$(BUILD_DIR)/tests/test_cli_cache.o
+	$(CXX) $^ $(LDLIBS) -o $@
+
+# `all` is included so `make check` never leaves a stale $(BUILD_DIR)/leann
+# behind for manual testing: the test targets alone do not build the binary.
+check: all test persistence-test core-safety-test c-api-test cli-cache-test
+
 clean:
 	rm -rf "$(BUILD_DIR)"
 
@@ -76,3 +91,4 @@ clean:
 -include $(BUILD_DIR)/tests/test_core_safety.d
 -include $(BUILD_DIR)/tests/test_c_api.d
 -include $(BUILD_DIR)/tests/test_c_header.d
+-include $(BUILD_DIR)/tests/test_cli_cache.d
