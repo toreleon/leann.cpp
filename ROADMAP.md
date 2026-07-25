@@ -1,5 +1,24 @@
 # Roadmap from spike to repository-grade system
 
+## Completed in v0.4 operability
+
+- Strict per-command option validation with correction hints, replacing a
+  parser that silently ignored an unrecognized option and answered with its
+  defaults.
+- Per-command help, a command overview, and `--version`.
+- Opt-in `--format json` for `build`, `search`, `stats`, `bench`, and
+  `doctor`, with UTF-8 validation and fail-closed rejection of document bytes
+  that JSON cannot represent; the parsed text output is unchanged.
+- Optional build progress and cooperative cancellation in the library, with
+  SIGINT/SIGTERM cancellation in the CLI, exit status 130, and no leaked
+  locks, temporaries, or partially published pairs.
+- Advisory lock descriptors recording pid, host, and start time, without
+  making acquisition depend on them.
+- `leann doctor` artifact inspection with a repair mode limited to provably
+  safe removals and a separate explicit `--force-unlock`.
+- A `cli-cache-test` target and a `check` aggregate for the CMake-free build
+  path, which previously could not run the CLI suite at all.
+
 ## Completed in v0.3 integrity hardening
 
 - Versioned corpus identity in both artifacts with pre-embedding pair
@@ -85,8 +104,10 @@ dataset too large for dense in-memory construction.
 - Add a bounded hot embedding cache.
 - Add a pinned llama.cpp-compatible retrieval example over the completed C
   callback ABI.
-- Add cancellation, progress, structured JSON output, and service mode.
-- Add stale-lock/backup inspection and recovery commands.
+- Add service mode. Cancellation, progress, and structured JSON output shipped
+  in v0.4.
+- Extend recovery beyond the v0.4 `doctor` inspection: cross-prefix scanning
+  and the temporaries `bench` writes next to a `--raw-latencies` target.
 - Package reproducible releases for macOS arm64 and Linux x86_64.
 
 Exit gate: end-to-end local RAG demo survives restart/update, reports its

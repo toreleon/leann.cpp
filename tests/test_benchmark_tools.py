@@ -29,6 +29,8 @@ from run_large_scale_benchmark import (  # noqa: E402
     exact_topk_block,
     generate_cache,
     generate_ground_truth,
+    is_build_residue,
+    prefix_artifacts,
     run_repeated_stage,
 )
 from openai_embedding_proxy import Metrics as ProxyMetrics  # noqa: E402
@@ -211,6 +213,32 @@ class BenchmarkToolsTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "SHA-256"):
                 validate_cache_source(cache_metadata, documents)
 
+    def test_build_residue_is_excluded_from_stage_artifacts(self) -> None:
+        # Index::build appends a random token, so the residue names end in the
+        # token rather than in ".tmp"/".bak". A stage that counted them would
+        # see its own checkpoint as changed after an interrupted build.
+        self.assertTrue(is_build_residue("big.leann.tmp.6a17d62f59cd98dc"))
+        self.assertTrue(is_build_residue("big.docs.bak.0f1e2d3c4b5a6978"))
+        self.assertTrue(is_build_residue("legacy.leann.tmp"))
+        self.assertFalse(is_build_residue("big.leann"))
+        self.assertFalse(is_build_residue("big.docs"))
+
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            prefix = directory / "big"
+            for name in ("big.leann", "big.docs"):
+                (directory / name).write_bytes(b"artifact")
+            for name in (
+                "big.leann.tmp.6a17d62f59cd98dc",
+                "big.docs.tmp.6a17d62f59cd98dc",
+                "big.leann.bak.0f1e2d3c4b5a6978",
+            ):
+                (directory / name).write_bytes(b"residue")
+            (directory / "big.leann.lock").mkdir()
+
+            artifacts = sorted(path.name for path in prefix_artifacts(prefix))
+            self.assertEqual(artifacts, ["big.docs", "big.leann"])
+
     def test_tie_stable_topk(self) -> None:
         corpus = np.array([[1, 0], [1, 0], [0, 1]], dtype=np.float32)
         queries = np.array([[1, 0]], dtype=np.float32)
@@ -271,6 +299,81 @@ class BenchmarkToolsTest(unittest.TestCase):
             )
             vectors, _ = read_cache(cache)
             self.assertEqual(vectors.shape, (3, 4))
+
+    def test_request_concurrency_produces_identical_cache_bytes(self) -> None:
+        model = {
+            "embedding_model": "fake",
+            "native_fingerprint": "fake-fp",
+            "declared_identity": "test",
+            "artifact": None,
+            "sha256": "b" * 64,
+            "identity_strength": "declared",
+        }
+        digests = []
+        payloads = []
+        for concurrency in (1, 8):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source = root / "documents.txt"
+                source.write_text(
+                    "".join(f"document number {index}\n" for index in range(64)),
+                    encoding="utf-8",
+                )
+                cache = root / "corpus.f32"
+                declared = generate_cache(
+                    client=FakeEmbeddings(),
+                    source_path=source,
+                    cache_path=cache,
+                    fingerprint="fake-fp",
+                    model=model,
+                    role="corpus",
+                    batch_size=3,
+                    dimension=4,
+                    bindings={},
+                    concurrency=concurrency,
+                )
+                self.assertEqual(declared["cache"]["count"], 64)
+                self.assertEqual(
+                    declared["generation"]["request_concurrency"], concurrency
+                )
+                digests.append(hashlib.sha256(cache.read_bytes()).hexdigest())
+                payloads.append(declared["generation"]["payload_sha256"])
+        self.assertEqual(digests[0], digests[1])
+        self.assertEqual(payloads[0], payloads[1])
+
+    def test_concurrent_generation_surfaces_endpoint_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "documents.txt"
+            source.write_text(
+                "".join(f"document number {index}\n" for index in range(32)),
+                encoding="utf-8",
+            )
+            cache = root / "corpus.f32"
+            with self.assertRaisesRegex(RuntimeError, "interruption"):
+                generate_cache(
+                    client=FailAfterOneBatch(),
+                    source_path=source,
+                    cache_path=cache,
+                    fingerprint="fake-fp",
+                    model={
+                        "embedding_model": "fake",
+                        "native_fingerprint": "fake-fp",
+                        "declared_identity": "test",
+                        "artifact": None,
+                        "sha256": "b" * 64,
+                        "identity_strength": "declared",
+                    },
+                    role="corpus",
+                    batch_size=4,
+                    dimension=4,
+                    bindings={},
+                    concurrency=4,
+                )
+            self.assertFalse(cache.exists())
+            self.assertTrue(
+                cache.with_name(cache.name + ".checkpoint.json").exists()
+            )
 
     def test_repeated_stage_reuses_only_exact_protocol(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

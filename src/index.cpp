@@ -1,6 +1,7 @@
 #include "leann/index.hpp"
 
 #include "artifact_publisher.hpp"
+#include "build_lock.hpp"
 #include "checksum.hpp"
 #include "format.hpp"
 #include "product_quantizer.hpp"
@@ -192,11 +193,9 @@ bool is_zero_identity(const PairIdentity & identity) {
                        [](std::uint8_t byte) { return byte == 0U; });
 }
 
-std::filesystem::path lock_path_for(const std::filesystem::path & target) {
-    auto result = target;
-    result += ".lock";
-    return result;
-}
+using detail::lock_path_for;
+using detail::remove_lock_owner;
+using detail::write_lock_owner;
 
 class BuildLocks {
   public:
@@ -223,6 +222,7 @@ class BuildLocks {
                                          lock.string() + "': " + reason);
             }
             locks_.push_back(lock);
+            write_lock_owner(lock);
         }
     }
 
@@ -234,6 +234,7 @@ class BuildLocks {
         std::string failures;
         for (auto current = locks_.rbegin(); current != locks_.rend();
              ++current) {
+            remove_lock_owner(*current);
             std::error_code error;
             std::filesystem::remove(*current, error);
             if (error) {
@@ -256,6 +257,7 @@ class BuildLocks {
     void release_noexcept() noexcept {
         for (auto current = locks_.rbegin(); current != locks_.rend();
              ++current) {
+            remove_lock_owner(*current);
             std::error_code ignored;
             std::filesystem::remove(*current, ignored);
         }
@@ -299,6 +301,71 @@ unique_adjacent_path(const std::filesystem::path & target,
     throw std::runtime_error("cannot allocate a unique artifact path for " +
                              target.string());
 }
+
+// Drives BuildConfig::report_progress and BuildConfig::should_cancel. Both are
+// optional, so every call is guarded; when neither is set the whole class
+// costs one branch per checkpoint.
+//
+// Cancellation is cooperative and only observed at the checkpoints below, so
+// its latency is bounded by the longest uncancellable span rather than being
+// instantaneous. Those spans are DocumentStore::write and
+// train_product_quantizer, each a single opaque call over the whole corpus;
+// this is stated in DESIGN.md rather than papered over.
+class BuildObserver {
+  public:
+    explicit BuildObserver(const BuildConfig & config) : config_(config) {}
+
+    // Enters a named phase and reports its zero point. `total` is 0 when the
+    // phase has no countable unit.
+    void begin(std::string_view stage, std::uint64_t total) {
+        stage_ = stage;
+        total_ = total;
+        completed_ = 0;
+        report();
+    }
+
+    // Advances the current phase, reporting at most once per stride so a
+    // multi-million-node loop does not spend its time formatting progress.
+    void advance(std::uint64_t completed) {
+        completed_ = completed;
+        if (completed_ == total_ || completed_ < reported_ ||
+            completed_ - reported_ >= stride) {
+            report();
+        }
+    }
+
+    // Throws BuildCancelled when the caller has asked to stop. Safe at any
+    // point before the publication transaction begins: unwinding removes the
+    // temporary artifacts and the build locks.
+    void checkpoint() const {
+        if (config_.should_cancel && config_.should_cancel()) {
+            throw BuildCancelled("build cancelled during " +
+                                 std::string(stage_));
+        }
+    }
+
+    // The common case inside a counted loop.
+    void step(std::uint64_t completed) {
+        checkpoint();
+        advance(completed);
+    }
+
+  private:
+    static constexpr std::uint64_t stride = 4096;
+
+    void report() {
+        reported_ = completed_;
+        if (config_.report_progress) {
+            config_.report_progress(BuildProgress{stage_, completed_, total_});
+        }
+    }
+
+    const BuildConfig & config_;
+    std::string_view stage_{};
+    std::uint64_t total_ = 0;
+    std::uint64_t completed_ = 0;
+    std::uint64_t reported_ = 0;
+};
 
 void require_regular_or_missing(const std::filesystem::path & path) {
     std::error_code error;
@@ -366,6 +433,9 @@ void Index::build(const std::filesystem::path & index_path,
         }
     } temporary_cleanup{temporary_index_path, temporary_documents_path};
 
+    BuildObserver observer(config);
+    observer.begin("writing documents", 0);
+    observer.checkpoint();
     DocumentStore::write(temporary_documents_path, documents);
     PairIdentity pair_identity{};
     {
@@ -374,10 +444,12 @@ void Index::build(const std::filesystem::path & index_path,
         pair_identity = candidate_documents.pair_identity();
     }
 
+    observer.begin("embedding", documents.size());
     std::vector<Embedding> embeddings;
     embeddings.reserve(documents.size());
     for (std::size_t begin = 0; begin < documents.size();
          begin += config.embedding_batch_size) {
+        observer.checkpoint();
         const std::size_t end =
             std::min(documents.size(), begin + config.embedding_batch_size);
         auto batch = embedder.embed(documents.subspan(begin, end - begin));
@@ -389,6 +461,7 @@ void Index::build(const std::filesystem::path & index_path,
             normalize(embedding);
             embeddings.push_back(std::move(embedding));
         }
+        observer.advance(embeddings.size());
     }
 
     const std::size_t count = embeddings.size();
@@ -408,15 +481,19 @@ void Index::build(const std::filesystem::path & index_path,
                       static_cast<std::ptrdiff_t>(i * hnsw_dimension));
     }
 
+    observer.begin("building graph", count);
     hnswlib::InnerProductSpace space(hnsw_dimension);
     hnswlib::HierarchicalNSW<float> hnsw(
         &space, count, config.graph_degree, config.ef_construction,
         config.random_seed);
     for (std::size_t i = 0; i < count; ++i) {
+        observer.step(i);
         hnsw.addPoint(hnsw_vectors.data() + i * hnsw_dimension,
                       static_cast<hnswlib::labeltype>(i));
     }
+    observer.advance(count);
 
+    observer.begin("extracting adjacency", count);
     std::vector<std::vector<std::uint32_t>> original(count);
     std::vector<std::uint32_t> internal_to_external(count);
     for (std::size_t internal = 0; internal < count; ++internal) {
@@ -428,6 +505,7 @@ void Index::build(const std::filesystem::path & index_path,
         internal_to_external[internal] = static_cast<std::uint32_t>(label);
     }
     for (std::size_t internal = 0; internal < count; ++internal) {
+        observer.step(internal);
         const std::uint32_t source = internal_to_external[internal];
         for (const hnswlib::tableint neighbor :
              hnsw.getConnectionsWithLock(
@@ -438,11 +516,14 @@ void Index::build(const std::filesystem::path & index_path,
             original[source].push_back(internal_to_external[neighbor]);
         }
     }
+    observer.advance(count);
 
     const std::uint32_t maximum_level =
         hnsw.maxlevel_ < 0 ? 0U : static_cast<std::uint32_t>(hnsw.maxlevel_);
+    observer.begin("extracting upper layers", maximum_level);
     std::vector<SerializedUpperLayer> upper_layers(maximum_level);
     for (std::uint32_t level = 1; level <= maximum_level; ++level) {
+        observer.step(level - 1U);
         std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>>
             adjacency;
         for (std::size_t internal = 0; internal < count; ++internal) {
@@ -506,7 +587,9 @@ void Index::build(const std::filesystem::path & index_path,
                cosine_distance(embeddings[source], embeddings[rhs]);
     };
 
+    observer.begin("pruning", count);
     for (std::uint32_t source = 0; source < count; ++source) {
+        observer.step(source);
         auto neighbors = original[source];
         std::sort(neighbors.begin(), neighbors.end());
         neighbors.erase(std::unique(neighbors.begin(), neighbors.end()),
@@ -527,9 +610,11 @@ void Index::build(const std::filesystem::path & index_path,
         }
     }
 
+    observer.begin("compacting adjacency", count);
     std::vector<std::uint64_t> offsets(count + 1, 0);
     std::vector<std::uint32_t> edges;
     for (std::uint32_t source = 0; source < count; ++source) {
+        observer.step(source);
         auto & neighbors = graph[source];
         std::sort(neighbors.begin(), neighbors.end());
         neighbors.erase(std::unique(neighbors.begin(), neighbors.end()),
@@ -546,22 +631,29 @@ void Index::build(const std::filesystem::path & index_path,
     std::uint64_t sketch_seed = 0;
     std::vector<std::uint64_t> sketches;
     detail::ProductQuantizerModel pq;
+    observer.begin("quantizing", count);
     if (config.approximation == ApproximationKind::SimHash) {
         sketch_seed =
             splitmix64(static_cast<std::uint64_t>(config.random_seed) ^
                        0x4c45414e4e435050ULL);
         sketches.reserve(count * (config.sketch_bits / 64U));
         for (const Embedding & embedding : embeddings) {
+            observer.step(sketches.size() / std::max<std::size_t>(
+                                                1, config.sketch_bits / 64U));
             auto sketch =
                 make_sketch(embedding, config.sketch_bits, sketch_seed);
             sketches.insert(sketches.end(), sketch.begin(), sketch.end());
         }
     } else {
+        // train_product_quantizer is a single opaque call over the corpus, so
+        // this checkpoint bounds cancellation latency by one full PQ pass.
+        observer.checkpoint();
         pq = detail::train_product_quantizer(
             embeddings, config.pq_subquantizers, config.pq_bits,
             config.pq_training_iterations, config.pq_training_samples,
             config.random_seed);
     }
+    observer.advance(count);
 
     const std::uint32_t entry_point = static_cast<std::uint32_t>(
         hnsw.getExternalLabel(hnsw.enterpoint_node_));
@@ -570,6 +662,8 @@ void Index::build(const std::filesystem::path & index_path,
         throw std::runtime_error("embedder fingerprint is too long");
     }
 
+    observer.begin("writing index", 0);
+    observer.checkpoint();
     std::ofstream output(temporary_index_path,
                          std::ios::binary | std::ios::trunc);
     if (!output) {
@@ -635,12 +729,18 @@ void Index::build(const std::filesystem::path & index_path,
     // Validate both complete temporary artifacts before entering the short
     // publication transaction. The index is renamed last and acts as the
     // commit marker; readers either see a matching pair or fail closed.
+    observer.begin("verifying", 0);
+    observer.checkpoint();
     {
         const auto candidate_index = Index::load(temporary_index_path);
         auto candidate_documents =
             DocumentStore::open(temporary_documents_path);
         candidate_index.validate_document_store(candidate_documents);
     }
+    // Last cancellation point. Beyond here the publication transaction runs to
+    // completion so an interrupt can never leave a mixed artifact pair.
+    observer.checkpoint();
+    observer.begin("publishing", 0);
     detail::publish_artifact_pair(
         temporary_index_path, temporary_documents_path, normalized_index,
         normalized_documents, index_backup, documents_backup);

@@ -1,9 +1,79 @@
 # Validation record
 
-This file records validation of the measured `v0.2-spike` and the subsequent
-`v0.3` artifact-integrity hardening. Results are implementation measurements
-on one public corpus and one machine, not a reproduction of every LEANN paper
-result.
+This file records validation of the measured `v0.2-spike`, the subsequent
+`v0.3` artifact-integrity hardening, and the `v0.4` operability work. Results
+are implementation measurements on one public corpus and one machine, not a
+reproduction of every LEANN paper result.
+
+## v0.4 operability gate
+
+The machine-runnable clean-build command is:
+
+```bash
+make HNSWLIB_DIR=/path/to/hnswlib \
+  BUILD_DIR=/new/empty/build-directory check
+make HNSWLIB_DIR=/path/to/hnswlib BUILD_DIR=/new/empty/build-asan \
+  CXXFLAGS="-std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
+  LDLIBS="-pthread -fsanitize=address,undefined" \
+  core-safety-test persistence-test cli-cache-test
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
+
+Validated on Apple arm64 with AppleClang 21.0.0:
+
+- All six C++ suites and 73 Python tests: pass.
+- ASan/UBSan over the core-safety, persistence, and CLI suites: clean.
+- A mistyped option, an option belonging to another command, a stray
+  positional argument, and a known option missing its value: each rejected
+  with a message naming the option, and a correction hint where one is within
+  edit distance 2.
+- Every option the shipped harness scripts pass to `build`, `search`, `stats`,
+  and `bench` is accepted by the new validation. Checked by invoking the
+  binary with each command's full documented option set — 31 options for
+  `bench`, 25 for `build` — and confirming no "unknown option" or "unexpected
+  argument" response: pass.
+- The text output of `search`, `stats`, and `bench` is byte-identical to the
+  pre-change binary on the same index, compared by building `HEAD` separately
+  and diffing stdout and stderr; only wall-clock timing fields differ.
+  `build`'s two artifact-path lines changed deliberately, dropping the
+  `std::filesystem::path` quoting: pass.
+- SIGINT sent to a running `search` terminates it by the default disposition
+  rather than being caught and ignored: pass. Handlers are installed only by
+  the commands that poll for cancellation.
+- A build parked in PQ training — an uncancellable span, forced long with
+  `--pq-iterations 500000` — survives the first SIGINT, which only sets the
+  cooperative flag, and is terminated by the second: pass.
+- `doctor --repair` removes nothing at all while a build lock is present, and
+  a refused `--force-unlock` deletes nothing before refusing: pass.
+- A boolean flag is not consumed as another option's value:
+  `doctor --index --repair` reports a missing value instead of running on the
+  prefix `--repair` with repair silently disabled: pass.
+- A failed JSON document writes nothing to stdout: pass.
+- JSON escaping of quotes, backslashes, tabs, newlines, and other control
+  bytes; pass-through of valid multi-byte UTF-8: pass.
+- Invalid UTF-8 lead bytes, overlong encodings, surrogate halves, code points
+  above U+10FFFF, and truncated sequences: rejected before emission.
+- `--format json` for `stats`, `search`, `build`, and `bench` parses as JSON
+  and carries the same keys as the corresponding text output: pass.
+- SIGINT during a 120,000-document build: exit status 130, no published pair,
+  and no `.lock`, `.tmp.*`, or `.bak.*` remaining. Cancellation was observed
+  during the graph-construction phase.
+- An already-requested cancellation token stops a build and leaves the working
+  directory clean; an untriggered token leaves the build undisturbed: pass.
+- Build progress is monotonic within a phase, never exceeds its declared
+  total, and ends on the publication phase: pass.
+- `doctor --repair` removes an abandoned temporary only when no lock is
+  present, and removes a backup only when the live pair loads and validates:
+  pass.
+- `doctor --force-unlock` against a lock whose descriptor names this running
+  process: refused.
+- A lock with no descriptor reports liveness `unknown`, never `stale`: pass.
+
+This gate exercises cancellation, option handling, and recovery decisions. It
+does not measure cancellation latency under a GGUF embedder, does not prove
+fsync or power-loss recovery, and does not establish liveness detection across
+hosts or after pid reuse — the `unknown` liveness state exists because those
+cases are not decidable from the lock alone.
 
 ## v0.3 artifact integrity gate
 

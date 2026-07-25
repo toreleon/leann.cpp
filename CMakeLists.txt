@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(leann_cpp VERSION 0.3.0 LANGUAGES C CXX)
+project(leann_cpp VERSION 0.4.0 LANGUAGES C CXX)
 
 include(FetchContent)
 include(GNUInstallDirs)
@@ -24,6 +24,7 @@ endif()
 
 add_library(leann_cpp
     src/artifact_publisher.cpp
+    src/build_lock.cpp
     src/c_api.cpp
     src/checksum.cpp
     src/document_store.cpp
@@ -85,6 +86,10 @@ endif()
 add_executable(leann app/main.cpp)
 target_include_directories(leann PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(leann PRIVATE leann::leann hnswlib::hnswlib)
+# app/main.cpp carries an #ifndef fallback for the same macro so the
+# CMake-free `make` path still compiles.
+target_compile_definitions(
+    leann PRIVATE LEANN_VERSION_STRING="${PROJECT_VERSION}")
 if(LEANN_HNSWLIB_INCLUDES)
     target_include_directories(leann SYSTEM PRIVATE ${LEANN_HNSWLIB_INCLUDES})
 endif()

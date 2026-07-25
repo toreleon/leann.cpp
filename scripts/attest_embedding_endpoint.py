@@ -7,9 +7,9 @@ The capture phase binds an integrity-checked cache checkpoint to:
 * the exact GGUF bytes named by ``/props`` and by the checkpoint;
 * an expected llama.cpp ``build_info`` value;
 * the checkpoint's exact source bytes, model descriptor, endpoint, and input hash;
-* on macOS, the unchanged listening PID, process start time, command, working
-  directory, executable bytes, model argument, host, and port observed before
-  and after the file/HTTP checks; and
+* on macOS (``ps``/``lsof``) and on Linux (``/proc``), the unchanged listening
+  PID, process start time, command, working directory, executable bytes, model
+  argument, host, and port observed before and after the file/HTTP checks; and
 * a required post-run native parity binding.
 
 The finalize phase consumes the immutable live capture and a later
@@ -30,6 +30,7 @@ import re
 import shlex
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -557,6 +558,224 @@ def darwin_process_snapshot(
     return {**stable, "identity_sha256": canonical_hash(stable)}
 
 
+def _linux_boot_time_epoch() -> float:
+    with open("/proc/stat", encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith("btime "):
+                try:
+                    return float(line.split()[1])
+                except (IndexError, ValueError) as error:
+                    raise AttestationError("cannot parse /proc/stat btime") from error
+    raise AttestationError("/proc/stat does not report btime")
+
+
+def _linux_hex_address(raw: str) -> str:
+    """Decode a /proc/net/tcp local_address column into a printable host."""
+
+    if len(raw) == 8:
+        packed = struct.pack("<I", int(raw, 16))
+        return socket.inet_ntop(socket.AF_INET, packed)
+    if len(raw) == 32:
+        packed = b"".join(
+            struct.pack("<I", int(raw[offset : offset + 8], 16))
+            for offset in range(0, 32, 8)
+        )
+        return socket.inet_ntop(socket.AF_INET6, packed)
+    raise AttestationError(f"cannot parse /proc/net address {raw!r}")
+
+
+def _linux_listening_socket_inodes(host: str, port: int) -> dict[int, str]:
+    """Map listening socket inodes bound to host:port to their printed address."""
+
+    endpoint_addresses = _resolved_host_addresses(host)
+    inodes: dict[int, str] = {}
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        path = pathlib.Path(table)
+        if not path.exists():
+            continue
+        for index, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
+            if index == 0:
+                continue
+            fields = line.split()
+            if len(fields) < 10 or fields[3] != "0A":
+                continue
+            address, _, port_text = fields[1].partition(":")
+            try:
+                listener_port = int(port_text, 16)
+            except ValueError as error:
+                raise AttestationError(
+                    f"cannot parse {table} listener port {fields[1]!r}"
+                ) from error
+            if listener_port != port:
+                continue
+            listener_host = _linux_hex_address(address)
+            if listener_host != host and listener_host not in endpoint_addresses:
+                continue
+            try:
+                inodes[int(fields[9])] = f"{listener_host}:{listener_port}"
+            except ValueError as error:
+                raise AttestationError(
+                    f"cannot parse {table} socket inode {fields[9]!r}"
+                ) from error
+    return inodes
+
+
+def _linux_pids_holding_inodes(inodes: Mapping[int, str]) -> dict[int, str]:
+    """Find every PID whose open descriptors include one of ``inodes``."""
+
+    wanted = {f"socket:[{inode}]": name for inode, name in inodes.items()}
+    owners: dict[int, str] = {}
+    for entry in pathlib.Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        descriptors = entry / "fd"
+        try:
+            handles = list(descriptors.iterdir())
+        except (PermissionError, FileNotFoundError, NotADirectoryError):
+            continue
+        for handle in handles:
+            try:
+                target = os.readlink(handle)
+            except OSError:
+                continue
+            if target in wanted:
+                owners[int(entry.name)] = wanted[target]
+                break
+    return owners
+
+
+def _linux_process_start_epoch(pid: int) -> float:
+    raw = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    closing = raw.rfind(")")
+    if closing < 0:
+        raise AttestationError(f"cannot parse /proc/{pid}/stat")
+    fields = raw[closing + 2 :].split()
+    # Fields after comm are numbered from 3; starttime is field 22.
+    if len(fields) < 20:
+        raise AttestationError(f"/proc/{pid}/stat is truncated")
+    try:
+        ticks = float(fields[19])
+    except ValueError as error:
+        raise AttestationError(f"cannot parse /proc/{pid}/stat starttime") from error
+    hertz = os.sysconf("SC_CLK_TCK")
+    if not hertz or hertz <= 0:
+        raise AttestationError("cannot resolve SC_CLK_TCK")
+    return _linux_boot_time_epoch() + ticks / float(hertz)
+
+
+def linux_process_snapshot(
+    *,
+    host: str,
+    port: int,
+    expected_pid: int | None,
+    expected_artifact: pathlib.Path,
+) -> dict[str, Any]:
+    """Bind one Linux listener to /proc identity and immutable files."""
+
+    if not sys.platform.startswith("linux"):
+        raise AttestationError("Linux /proc process proof is unavailable")
+    inodes = _linux_listening_socket_inodes(host, port)
+    if not inodes:
+        raise AttestationError(f"no listening socket is bound to {host}:{port}")
+    owners = _linux_pids_holding_inodes(inodes)
+    if expected_pid is not None:
+        owners = {
+            pid: name for pid, name in owners.items() if pid == expected_pid
+        }
+    if len(owners) != 1:
+        raise AttestationError(
+            f"expected exactly one listening process on {host}:{port}, "
+            f"found {len(owners)}"
+        )
+    pid, listener_name = next(iter(owners.items()))
+
+    start_epoch = _linux_process_start_epoch(pid)
+    raw_cmdline = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+    argv = [token for token in raw_cmdline.decode("utf-8").split("\0") if token]
+    if not argv:
+        raise AttestationError("process command line is empty")
+    command = shlex.join(argv)
+
+    try:
+        cwd = pathlib.Path(os.readlink(f"/proc/{pid}/cwd")).resolve(strict=True)
+    except OSError as error:
+        raise AttestationError(
+            f"cannot prove working directory for PID {pid}"
+        ) from error
+    try:
+        executable_path = pathlib.Path(os.readlink(f"/proc/{pid}/exe"))
+    except OSError as error:
+        raise AttestationError(f"cannot prove executable for PID {pid}") from error
+    executable = hash_regular_file(executable_path)
+
+    command_port = _option_value(argv, {"--port"})
+    command_host = _option_value(argv, {"--host"})
+    command_model = _option_value(argv, {"--model", "-m"})
+    if command_port is None or command_host is None or command_model is None:
+        raise AttestationError(
+            "process command must explicitly declare --host, --port, and --model"
+        )
+    try:
+        parsed_command_port = int(command_port)
+    except ValueError as error:
+        raise AttestationError("process --port is not an integer") from error
+    if parsed_command_port != port or command_host != host:
+        raise AttestationError("process command host/port differs from the listener")
+    command_model_path = pathlib.Path(command_model)
+    if not command_model_path.is_absolute():
+        command_model_path = cwd / command_model_path
+    command_model_path = command_model_path.resolve(strict=True)
+    if command_model_path != expected_artifact.resolve(strict=True):
+        raise AttestationError(
+            "process --model path differs from the expected GGUF artifact"
+        )
+
+    stable = {
+        "provider": "linux-proc-v1",
+        "pid": pid,
+        "process_start_epoch": start_epoch,
+        "process_start_time": dt.datetime.fromtimestamp(
+            start_epoch, dt.timezone.utc
+        ).isoformat(),
+        "command": command,
+        "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
+        "working_directory": str(cwd),
+        "listener": {
+            "host": host,
+            "port": port,
+            "proc_net_name": listener_name,
+        },
+        "executable": executable,
+        "command_model_path": str(command_model_path),
+    }
+    return {**stable, "identity_sha256": canonical_hash(stable)}
+
+
+def platform_process_snapshot(
+    *,
+    host: str,
+    port: int,
+    expected_pid: int | None,
+    expected_artifact: pathlib.Path,
+) -> dict[str, Any]:
+    """Dispatch to the process-proof provider for the running platform."""
+
+    if sys.platform == "darwin":
+        provider = darwin_process_snapshot
+    elif sys.platform.startswith("linux"):
+        provider = linux_process_snapshot
+    else:
+        raise AttestationError(
+            f"process proof is unavailable on platform {sys.platform!r}"
+        )
+    return provider(
+        host=host,
+        port=port,
+        expected_pid=expected_pid,
+        expected_artifact=expected_artifact,
+    )
+
+
 def _checkpoint_stable(payload: Mapping[str, Any]) -> dict[str, Any]:
     keys = (
         "schema",
@@ -883,7 +1102,7 @@ def capture_attestation(
     expected_source_count: int,
     timeout: float,
     require_process_proof: bool,
-    process_probe: ProcessProbe = darwin_process_snapshot,
+    process_probe: ProcessProbe = platform_process_snapshot,
     json_query: JsonQuery = query_json,
 ) -> dict[str, Any]:
     """Capture a live, race-checked endpoint/checkpoint attestation."""
@@ -915,7 +1134,7 @@ def capture_attestation(
     proof_requested = require_process_proof or expected_pid is not None
     process_before: dict[str, Any] | None = None
     process_after: dict[str, Any] | None = None
-    if proof_requested or sys.platform == "darwin":
+    if proof_requested or sys.platform == "darwin" or sys.platform.startswith("linux"):
         try:
             process_before = process_probe(
                 host=endpoint["host"],
