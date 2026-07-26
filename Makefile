@@ -16,7 +16,7 @@ CORE_SOURCES := src/artifact_publisher.cpp src/build_lock.cpp src/c_api.cpp \
 CORE_OBJECTS := $(CORE_SOURCES:%.cpp=$(BUILD_DIR)/%.o)
 
 .PHONY: all test persistence-test core-safety-test c-api-test cli-cache-test \
-	check clean check-hnsw
+	artifact-fuzz-test check clean check-hnsw
 
 all: check-hnsw $(BUILD_DIR)/leann
 
@@ -77,9 +77,17 @@ $(BUILD_DIR)/leann_cli_cache_tests: $(CORE_OBJECTS) \
 	$(BUILD_DIR)/tests/test_cli_cache.o
 	$(CXX) $^ $(LDLIBS) -o $@
 
+artifact-fuzz-test: check-hnsw $(BUILD_DIR)/leann_artifact_fuzz_tests
+	$(BUILD_DIR)/leann_artifact_fuzz_tests
+
+$(BUILD_DIR)/leann_artifact_fuzz_tests: $(CORE_OBJECTS) \
+	$(BUILD_DIR)/tests/test_artifact_fuzz.o
+	$(CXX) $^ $(LDLIBS) -o $@
+
 # `all` is included so `make check` never leaves a stale $(BUILD_DIR)/leann
 # behind for manual testing: the test targets alone do not build the binary.
-check: all test persistence-test core-safety-test c-api-test cli-cache-test
+check: all test persistence-test core-safety-test c-api-test cli-cache-test \
+	artifact-fuzz-test
 
 clean:
 	rm -rf "$(BUILD_DIR)"

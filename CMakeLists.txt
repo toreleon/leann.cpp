@@ -149,6 +149,26 @@ if(LEANN_BUILD_TESTS)
             leann_cli_cache_tests PRIVATE -Wall -Wextra -Wpedantic)
     endif()
     add_test(NAME leann_cli_cache_tests COMMAND leann_cli_cache_tests)
+
+    add_executable(leann_artifact_fuzz_tests tests/test_artifact_fuzz.cpp)
+    target_include_directories(
+        leann_artifact_fuzz_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(
+        leann_artifact_fuzz_tests PRIVATE leann::leann hnswlib::hnswlib)
+    if(LEANN_HNSWLIB_INCLUDES)
+        target_include_directories(
+            leann_artifact_fuzz_tests SYSTEM PRIVATE
+            ${LEANN_HNSWLIB_INCLUDES})
+    endif()
+    if(MSVC)
+        target_compile_options(
+            leann_artifact_fuzz_tests PRIVATE /W4 /permissive-)
+    else()
+        target_compile_options(
+            leann_artifact_fuzz_tests PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    add_test(
+        NAME leann_artifact_fuzz_tests COMMAND leann_artifact_fuzz_tests)
 endif()
 
 if(LEANN_ENABLE_LLAMA)
