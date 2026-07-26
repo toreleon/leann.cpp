@@ -1,0 +1,59 @@
+name: Feature request
+description: Propose a capability or a change of direction
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is a research spike, not a product. `ROADMAP.md` sequences the
+        work behind explicit exit gates, and `README.md`'s "Honest spike
+        boundaries" lists what the code deliberately does not do yet.
+
+        Please skim both first — a proposal that is already queued is still
+        worth commenting on, but it belongs on the existing thread.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: >
+        Describe the situation you are actually in, not the solution. What
+        were you trying to do, and what stopped you?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+
+  - type: dropdown
+    id: dependency
+    attributes:
+      label: Would this add a third-party dependency?
+      description: >
+        The dependency budget is deliberately tight: hnswlib and llama.cpp
+        only, both pinned by commit. SHA-256 and CRC32C are implemented
+        in-repo specifically to avoid a crypto dependency. A proposal that
+        needs a new dependency is not automatically rejected, but it needs a
+        strong reason.
+      options:
+        - "No"
+        - "Yes"
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence, if you have it
+      description: >
+        The docs deliberately separate "measured here" from "claimed
+        elsewhere". If you have a measurement — a benchmark, a profile, a
+        corpus where the current behaviour breaks down — it carries a lot
+        more weight than an estimate. If you do not, say so; an unmeasured
+        hunch is still a legitimate report.

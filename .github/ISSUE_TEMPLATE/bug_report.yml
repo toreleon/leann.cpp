@@ -1,0 +1,82 @@
+name: Bug report
+description: Something builds but behaves incorrectly at runtime
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For failures to *compile or link*, please use the **Build failure**
+        template instead — it asks for different information.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which area?
+      options:
+        - CLI (build / search / stats / bench / doctor)
+        - Library (leann::Index, DocumentStore)
+        - C API (include/leann/leann.h)
+        - Python benchmark harness (scripts/)
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: embedder
+    attributes:
+      label: Which embedder?
+      description: >
+        The hash embedder is deterministic and needs no model, so a
+        reproduction using it is far easier to act on. If the bug reproduces
+        with `--embedder hash`, please say so.
+      options:
+        - hash
+        - llama (GGUF)
+        - cache (LEANNBC2)
+        - Not applicable
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: >
+        The exact commands, in order. If the bug involves an artifact pair,
+        include how it was built — an index and its document store are a pair
+        sharing one corpus identity, and a mismatch is itself a common cause.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: "Output of `leann --version`, or the commit you built."
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS and compiler
+      placeholder: "macOS 15.3, AppleClang 16.0.0"
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        **If the CLI output looks wrong:** please paste the text output
+        verbatim rather than a screenshot. The text form is parsed by the
+        benchmark harness and is expected to be byte-stable, so exact
+        characters matter. `--format json` output is also welcome.

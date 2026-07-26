@@ -1,0 +1,78 @@
+name: Build failure
+description: The project does not compile or link on your machine
+title: "build: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Build failures are the most common problem reported against this
+        project, and they are almost always toolchain- or platform-specific.
+        The details below are what make one reproducible.
+
+        The floor is a C++20 standard library providing `std::bit_cast`,
+        `std::span`, and `std::ranges`: libstdc++ 11 (GCC 11) or libc++ 14.
+        CI covers `ubuntu-latest` and `macos-latest` only — everything else is
+        unmeasured, so a report from another platform is genuinely useful.
+
+  - type: dropdown
+    id: build-path
+    attributes:
+      label: Which build path?
+      description: >
+        The two paths have different dependency budgets. The Makefile path
+        cannot build the llama.cpp backend at all.
+      options:
+        - CMake (cmake -S . -B build)
+        - Makefile (make HNSWLIB_DIR=...)
+        - CMake with -DLEANN_ENABLE_LLAMA=ON
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      placeholder: "macOS 15.3 (Sequoia) / Ubuntu 22.04 / Windows 11"
+    validations:
+      required: true
+
+  - type: input
+    id: compiler
+    attributes:
+      label: Compiler and version
+      description: "Output of `c++ --version` or `g++ --version`."
+      placeholder: "AppleClang 16.0.0 / GCC 11.4.0 / MSVC 19.39"
+    validations:
+      required: true
+
+  - type: input
+    id: deployment-target
+    attributes:
+      label: macOS deployment target, if applicable
+      description: >
+        Only if you are on macOS. `echo $MACOSX_DEPLOYMENT_TARGET`, or the
+        value of `CMAKE_OSX_DEPLOYMENT_TARGET` if you set one. Leave blank if
+        you did not set either. This matters more than it looks: an empty
+        value means the target defaults to your host OS version.
+      placeholder: "13.0, or blank"
+
+  - type: textarea
+    id: command
+    attributes:
+      label: The exact command you ran
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: error
+    attributes:
+      label: The error output
+      description: >
+        The first error is the useful one — later errors are usually
+        cascading. Please include it verbatim rather than paraphrasing.
+      render: text
+    validations:
+      required: true

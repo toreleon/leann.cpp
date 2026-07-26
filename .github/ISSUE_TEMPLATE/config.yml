@@ -1,0 +1,17 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/toreleon/leann.cpp/security/advisories/new
+    about: >
+      Please report vulnerabilities privately, not as a public issue. See
+      SECURITY.md for what is and is not in scope.
+  - name: Contributing guide
+    url: https://github.com/toreleon/leann.cpp/blob/main/CONTRIBUTING.md
+    about: >
+      Build paths, test conventions, and the invariants a pull request must
+      not break.
+  - name: Design and binary formats
+    url: https://github.com/toreleon/leann.cpp/blob/main/DESIGN.md
+    about: >
+      The authoritative record of on-disk layouts and search-path invariants.
+      Read this before filing anything about artifact formats.
