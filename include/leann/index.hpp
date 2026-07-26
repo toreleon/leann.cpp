@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace leann {
@@ -40,6 +41,25 @@ class BuildCancelled : public std::runtime_error {
         : std::runtime_error(message) {}
 };
 
+// Upper bounds on the artifact card and the prefixes, enforced identically on
+// the write and the read side. The reader needs absolute caps rather than only
+// the remaining-bytes budget: a large index legitimately leaves gigabytes of
+// budget, so a hostile length field would otherwise be free to allocate it.
+// The fingerprint predates these caps and had only the remaining-bytes budget
+// bounding it. Real fingerprints are tens of bytes; the cap is generous and
+// removes the asymmetry with the descriptor fields beside it.
+inline constexpr std::size_t max_fingerprint_bytes = 4096;
+inline constexpr std::size_t max_model_source_bytes = 4096;
+inline constexpr std::size_t max_prefix_bytes = 1024;
+inline constexpr std::size_t max_card_entries = 256;
+inline constexpr std::size_t max_card_key_bytes = 256;
+inline constexpr std::size_t max_card_value_bytes = 4096;
+
+// Free-form publisher metadata carried inside the index: license, corpus
+// description, chunking recipe. Ordered as given and required to have unique
+// keys, so the same inputs produce the same bytes.
+using ArtifactCard = std::vector<std::pair<std::string, std::string>>;
+
 struct BuildConfig {
     std::uint32_t graph_degree = 16;
     std::uint32_t ef_construction = 100;
@@ -53,6 +73,17 @@ struct BuildConfig {
     std::uint32_t pq_training_samples = 4096;
     std::uint32_t embedding_batch_size = 32;
     std::uint32_t random_seed = 42;
+    // Prepended to every chunk before embedding, and again to every chunk
+    // recomputed during rerank. Never stored in the document store and never
+    // part of the corpus identity, so the store keeps the raw chunk bytes.
+    std::string document_prefix;
+    // Prepended to the query text by Index::search. Callers that embed their
+    // own query and use search_embedding must apply it themselves.
+    std::string query_prefix;
+    // Overrides the embedder's own descriptor source when non-empty, so a CLI
+    // can record "hf:OWNER/REPO/FILE" where the embedder only knows a path.
+    std::string model_source;
+    ArtifactCard card;
     // Optional observers. Both are called on the thread that called build, may
     // be empty, and must not throw BuildCancelled themselves.
     std::function<void(const BuildProgress &)> report_progress{};
@@ -99,9 +130,19 @@ struct IndexStats {
     std::uint64_t approximation_codebook_bytes = 0;
     std::uint64_t serialized_bytes = 0;
     std::uint64_t dense_vector_bytes_avoided = 0;
+    std::uint64_t model_bytes = 0;
+    std::uint32_t pooling_type = 0;
+    std::uint32_t context_tokens = 0;
     std::string approximation;
     std::string pair_identity;
     std::string embedder_fingerprint;
+    std::string model_source;
+    // Lowercase hex, matching pair_identity. All zeros when the build
+    // embedder had no model file.
+    std::string model_sha256;
+    std::string document_prefix;
+    std::string query_prefix;
+    ArtifactCard card;
 };
 
 class Index {
@@ -128,6 +169,13 @@ class Index {
     [[nodiscard]] std::size_t size() const noexcept;
     [[nodiscard]] const std::string & embedder_fingerprint() const noexcept;
     [[nodiscard]] const PairIdentity & pair_identity() const noexcept;
+    // The prefixes this index was built with. A caller that embeds its own
+    // query and calls search_embedding must prepend query_prefix itself;
+    // Index::search does it for the caller.
+    [[nodiscard]] const std::string & document_prefix() const noexcept;
+    [[nodiscard]] const std::string & query_prefix() const noexcept;
+    [[nodiscard]] const EmbedderDescriptor & model() const noexcept;
+    [[nodiscard]] const ArtifactCard & card() const noexcept;
     void validate_document_store(const DocumentStore & documents) const;
 
   private:
@@ -151,6 +199,10 @@ class Index {
     std::uint32_t pq_subdimension_ = 0;
     PairIdentity pair_identity_{};
     std::string embedder_fingerprint_;
+    EmbedderDescriptor model_{};
+    std::string document_prefix_;
+    std::string query_prefix_;
+    ArtifactCard card_;
     std::vector<std::uint64_t> offsets_;
     std::vector<std::uint32_t> edges_;
     std::vector<UpperLayer> upper_layers_;

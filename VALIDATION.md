@@ -1,9 +1,119 @@
 # Validation record
 
 This file records validation of the measured `v0.2-spike`, the subsequent
-`v0.3` artifact-integrity hardening, and the `v0.4` operability work. Results
-are implementation measurements on one public corpus and one machine, not a
-reproduction of every LEANN paper result.
+`v0.3` artifact-integrity hardening, the `v0.4` operability work, and the
+`v0.5` shareable-index work. Results are implementation measurements on one
+public corpus and one machine, not a reproduction of every LEANN paper result.
+
+## v0.5 shareable-index gate
+
+The machine-runnable commands are:
+
+```bash
+make HNSWLIB_DIR=/path/to/hnswlib BUILD_DIR=/new/empty/build check
+python3 -m unittest discover -s tests -p 'test_*.py'
+python3 scripts/chunk_corpus.py --input <corpus-dir> --output corpus.txt \
+  --max-bytes 1200
+leann build --docs corpus.txt --index corpus --embedder llama \
+  --model <gguf> --ctx 1280 --model-source hf:OWNER/REPO/FILE \
+  --document-prefix 'search_document: ' --query-prefix 'search_query: ' \
+  --card license=apache-2.0
+python3 scripts/publish_hf_index.py pack --index corpus --output upload \
+  --repo OWNER/NAME --leann ./leann
+leann pull hf:OWNER/NAME --manifest upload/leann.manifest
+leann verify --index upload/corpus --manifest upload/leann.manifest
+```
+
+Validated on Apple arm64 (M4 Pro, macOS 26.5.1) with AppleClang 21.0.0:
+
+- All six C++ suites and the 121-test Python suite: pass.
+- The llama-enabled library and CLI compile clean under
+  `-Wall -Wextra -Wpedantic -Werror`.
+- A descriptor round trip with deliberately distinct values in each field —
+  differing prefix lengths and differing pooling/context integers, so a
+  write/read transposition cannot survive: pass.
+- The document prefix reaches the embedder but not the document store: a
+  search result is the raw chunk: pass.
+- An index built with no descriptor options carries empty defaults: pass.
+- Rejected before any artifact is written, leaving no `.leann` behind: a
+  duplicate card key, a control character in a card value or a prefix, an
+  over-long model source, an over-long prefix, an over-full card, and invalid
+  UTF-8: each rejected.
+- A `LEANNC03` file is rejected with a message naming the migration boundary;
+  an unrelated magic still reports "not a leann.cpp index": pass.
+- `LEANNMF1` parsing rejects a wrong magic, an unknown key, a duplicate
+  singleton record, a blank line, CRLF endings, an uppercase or wrong-length
+  digest, a non-decimal size, a traversal or absolute file name, a bad repo
+  form, an unknown repo type, and a half-listed pair: each rejected.
+- A repository name, revision, or artifact name containing an apostrophe,
+  space, semicolon, backtick, dollar sign, or double quote is refused on both
+  the command line and inside a manifest, so a value cannot escape the
+  single-quoted shell argument `pull` prints for a person to paste: pass.
+- A manifest `revision` or `repo` containing a `..` dot segment is refused.
+  Without this the repository-agreement guard is bypassable: `curl` normalizes
+  dot segments before sending, so a revision of
+  `../../other/repo/resolve/main` would have printed a command fetching from a
+  repository the operator never named. Confirmed by serving the normalized
+  path shape from a local HTTP server and reading its access log: rejected.
+- A manifest whose `type` disagrees with the typed `datasets/` qualifier, and a
+  `push` whose `--repo`/`--repo-type`/`--revision` disagree with the manifest
+  being uploaded: each refused, the latter before any socket is opened.
+- `verify` cross-checks the manifest's `model` record against the model the
+  index records and fails on a disagreement: pass.
+- `--document-prefix` with `--embedder cache`, `--query-embedding-cache`
+  against a query-prefixed index, and `--ground-truth-cache` against a
+  document-prefixed index: each refused rather than silently mismeasured.
+- `verify` exits 1 on a manifest mismatch and 0 on a match; a manifest whose
+  `prefix` disagrees with `--index` is refused rather than compared. An edit
+  to the final byte of a `.docs` payload still loads as a valid pair and is
+  caught only by the manifest digest: pass.
+- `pack` run twice produces byte-identical `leann.manifest`, `README.md`, and
+  `.gitattributes`, containing no hostname, no absolute local path, and no
+  current year: pass.
+- `pack` opens no socket; `push` refuses without `--yes` and refuses without a
+  token, both before any socket is opened: pass.
+
+The measured seed index is the llama.cpp repository's own markdown at
+revision `c588c4f47683e73ad2d69f50480bec6cc85fd0f7`, chunked by
+`scripts/chunk_corpus.py --max-bytes 1200` into 1304 single-line chunks over
+223 files and 1,215,681 bytes of text, embedded with
+`nomic-embed-text-v1.5.Q4_K_M.gguf`
+(SHA-256 `d4e388894e09cf3816e8b0896d81d265b55e7a9fff9ab03fe8bf4ef5e11295ac`,
+84,106,624 bytes) at `--ctx 1280 --gpu-layers 99` on Metal:
+
+```text
+nodes                                   1,304
+directed edges                          6,658
+build wall time                        24.885 s
+index bytes                           132,988
+document-store bytes                1,231,453
+dense vectors not persisted         4,005,888
+```
+
+Two independent builds of that corpus, run about half an hour apart with the
+same options on the same machine, produced byte-identical artifacts
+(`.leann` `232339ad312e36d77328105fe3e8a92d797d3fd9d0d52d63202d1ba74ef9d997`,
+`.docs` `c3271987fe3f4a98e1e4b5fd5d6da3b75e055d04da38ee6d975ad0886dd37319`).
+That is same-machine, same-flag reproducibility only. Changing
+`--batch-tokens` or `--parallel` perturbs Metal batch composition enough to
+change the embeddings and therefore the graph, so those flags are part of what
+a recorded digest pins even though they are not part of the fingerprint.
+
+The recorded model digest was independently confirmed to equal Hugging Face's
+`x-linked-etag` for that file, so the descriptor's digest is the same value a
+downloader computes.
+
+This gate establishes that the descriptor round-trips, that its validation is
+fail-closed on both the write and the read side, that the prefixes are applied
+where they must be and stored where they must not, and that `pack`/`pull`/
+`verify` agree on one manifest grammar. It does **not** establish that the
+manifest is authentic — it is unsigned and there is no trust root — and it
+does not exercise a real download, because no network code exists in the
+binary. `push` has not been run against the live Hugging Face API from this
+repository: there is no token on the validated machine, so its request shapes
+are unverified against a live server. Retrieval quality of the seed index was
+not measured; the chunker packs paragraphs by byte budget across a whole
+source tree, which is a demonstration, not a tuned corpus.
 
 ## v0.4 operability gate
 
@@ -21,7 +131,7 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 Validated on Apple arm64 with AppleClang 21.0.0:
 
-- All six C++ suites and 73 Python tests: pass.
+- All six C++ suites and the Python suite: pass.
 - ASan/UBSan over the core-safety, persistence, and CLI suites: clean.
 - A mistyped option, an option belonging to another command, a stray
   positional argument, and a known option missing its value: each rejected
@@ -30,11 +140,13 @@ Validated on Apple arm64 with AppleClang 21.0.0:
 - Every option the shipped harness scripts pass to `build`, `search`, `stats`,
   and `bench` is accepted by the new validation. Checked by invoking the
   binary with each command's full documented option set — 31 options for
-  `bench`, 25 for `build` — and confirming no "unknown option" or "unexpected
+  `bench`, 30 for `build` — and confirming no "unknown option" or "unexpected
   argument" response: pass.
-- The text output of `search`, `stats`, and `bench` is byte-identical to the
+- The text output of `search` and `bench` is byte-identical to the
   pre-change binary on the same index, compared by building `HEAD` separately
   and diffing stdout and stderr; only wall-clock timing fields differ.
+  `stats` is byte-identical for its first seventeen lines and then appends
+  the embedder descriptor, which the v0.5 gate below re-checks.
   `build`'s two artifact-path lines changed deliberately, dropping the
   `std::filesystem::path` quoting: pass.
 - SIGINT sent to a running `search` terminates it by the default disposition
@@ -96,7 +208,9 @@ Validated on Apple arm64 with AppleClang 21:
   truncation tests: pass.
 - SHA-256 known-answer vectors for empty input and `abc`: pass.
 - CRC32C `123456789` known-answer vector: pass.
-- Valid `.leann` v3 / `.docs` v2 round trip and nonzero shared identity: pass.
+- Valid `.leann` v4 / `.docs` v2 round trip and nonzero shared identity: pass.
+- A `LEANNC03` index is rejected with a message naming the migration
+  boundary rather than reported as "not a leann.cpp index": pass.
 - Both directions of a same-count, same-byte-length cross-pair swap are
   rejected before the counting embedder is invoked: pass.
 - Index payload/footer corruption, truncation, and appended bytes: rejected.
@@ -162,7 +276,7 @@ Validated on Apple arm64 with AppleClang 21:
 - CLI cache/ground-truth parsing, atomic raw-result publication, benchmark
   checkpoint recovery, endpoint/process attestation, official runtime binding,
   independent embedding-parity recomputation, and strict result collection:
-  pass in the 66-test Python suite and all six CTest targets above.
+  pass in the Python suite and all six CTest targets above.
 
 The sanitizer run initially exposed hnswlib's unaligned `size_t` label slot for
 even FP32 dimensions. The builder now gives only the temporary HNSW vectors one
@@ -245,8 +359,10 @@ build wall time                    115.001 s
 build maximum RSS                1,607,237,632 bytes
 ```
 
-The `.leann` SHA-256 is
+The `.leann` SHA-256 was
 `5d2f7f5081f723f75464e6381ba9492055f54c29bbf12eead1d9435bd534c5fd`.
+That digest belongs to the `LEANNC03` format and is not reproducible by the
+current binary, which writes `LEANNC04`; the rest of the run is unaffected.
 
 ## Official LEANN comparison
 

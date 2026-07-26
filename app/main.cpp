@@ -3,6 +3,7 @@
 #include "leann/index.hpp"
 #include "build_lock.hpp"
 #include "checksum.hpp"
+#include "text.hpp"
 
 #include <hnswlib/hnswlib.h>
 
@@ -93,7 +94,12 @@ class Arguments {
                     valueless_.insert(std::move(key));
                     continue;
                 }
-                values_[std::move(key)] = argv[++i];
+                std::string value = argv[++i];
+                // Every occurrence is kept in argv order for the options that
+                // are repeatable; values_ keeps last-wins so every existing
+                // accessor and the strict validator are unchanged.
+                repeated_[key].push_back(value);
+                values_[std::move(key)] = std::move(value);
             } else {
                 positional_.push_back(std::move(key));
             }
@@ -129,6 +135,14 @@ class Arguments {
                                   std::string fallback = {}) const {
         const auto found = values_.find(std::string(key));
         return found == values_.end() ? std::move(fallback) : found->second;
+    }
+
+    // Every occurrence of a repeatable option, in the order given on the
+    // command line, so `--card a=1 --card b=2` keeps both.
+    [[nodiscard]] std::vector<std::string> all(std::string_view key) const {
+        const auto found = repeated_.find(std::string(key));
+        return found == repeated_.end() ? std::vector<std::string>{}
+                                        : found->second;
     }
 
     [[nodiscard]] std::string require(std::string_view key) const {
@@ -201,6 +215,7 @@ class Arguments {
 
   private:
     std::unordered_map<std::string, std::string> values_;
+    std::unordered_map<std::string, std::vector<std::string>> repeated_;
     std::unordered_set<std::string> flags_;
     std::unordered_set<std::string> valueless_;
     std::vector<std::string> positional_;
@@ -890,6 +905,10 @@ std::unique_ptr<leann::Embedder> make_embedder(const Arguments & args) {
 #ifdef LEANN_WITH_LLAMA
         leann::LlamaEmbedder::Config config;
         config.model_path = args.require("--model");
+        // --model-source is deliberately not read here: make_embedder is
+        // shared by search and bench, whose tables do not declare it. The
+        // build path passes it through BuildConfig::model_source instead,
+        // which overrides the embedder's own answer.
         config.context_tokens = args.unsigned_value("--ctx", 512);
         config.batch_tokens = args.unsigned_value("--batch-tokens", 2048);
         config.max_sequences = args.unsigned_value("--parallel", 8);
@@ -927,67 +946,10 @@ leann::SearchConfig search_config(const Arguments & args) {
 // would silently corrupt a consumer's parse.
 // ---------------------------------------------------------------------------
 
-// Length of the UTF-8 sequence introduced by `lead`, or 0 if it is not a legal
-// lead byte.
-[[nodiscard]] std::size_t utf8_sequence_length(unsigned char lead) {
-    if (lead < 0x80U) {
-        return 1;
-    }
-    if ((lead & 0xE0U) == 0xC0U) {
-        return 2;
-    }
-    if ((lead & 0xF0U) == 0xE0U) {
-        return 3;
-    }
-    if ((lead & 0xF8U) == 0xF0U) {
-        return 4;
-    }
-    return 0;
-}
-
-// Rejects overlong encodings, surrogate halves, and anything above U+10FFFF,
-// so a "valid" string here is valid to every conforming JSON reader.
-[[nodiscard]] bool is_valid_utf8(std::string_view text) {
-    std::size_t index = 0;
-    while (index < text.size()) {
-        const auto lead = static_cast<unsigned char>(text[index]);
-        const std::size_t length = utf8_sequence_length(lead);
-        if (length == 0 || index + length > text.size()) {
-            return false;
-        }
-        std::uint32_t code_point = 0;
-        switch (length) {
-        case 1:
-            code_point = lead;
-            break;
-        case 2:
-            code_point = lead & 0x1FU;
-            break;
-        case 3:
-            code_point = lead & 0x0FU;
-            break;
-        default:
-            code_point = lead & 0x07U;
-            break;
-        }
-        for (std::size_t offset = 1; offset < length; ++offset) {
-            const auto continuation =
-                static_cast<unsigned char>(text[index + offset]);
-            if ((continuation & 0xC0U) != 0x80U) {
-                return false;
-            }
-            code_point = (code_point << 6U) | (continuation & 0x3FU);
-        }
-        static constexpr std::array<std::uint32_t, 5> minimum{
-            0U, 0U, 0x80U, 0x800U, 0x10000U};
-        if (code_point < minimum[length] || code_point > 0x10FFFFU ||
-            (code_point >= 0xD800U && code_point <= 0xDFFFU)) {
-            return false;
-        }
-        index += length;
-    }
-    return true;
-}
+// UTF-8 validation lives in src/text.hpp so the library applies exactly the
+// same rule when it validates a descriptor. Two copies could disagree, and
+// then a build could publish an index whose `stats --format json` never works.
+using leann::detail::is_valid_utf8;
 
 class JsonWriter {
   public:
@@ -1423,6 +1385,10 @@ struct CommandSpec {
     std::string_view synopsis;
     std::string_view summary;
     std::span<const OptionGroup> groups;
+    // Name of the single positional argument this command accepts, empty when
+    // it accepts none. Positionals stay rejected by default: a stray token is
+    // otherwise indistinguishable from an option whose value went missing.
+    std::string_view positional_name{};
 };
 
 constexpr std::array<OptionSpec, 2> output_options{{
@@ -1524,10 +1490,39 @@ constexpr std::array<OptionSpec, 5> doctor_options{{
     {"--help", "", "print this help and exit"},
 }};
 
-constexpr std::array<OptionGroup, 2> build_groups{{
+// What a published index says about itself. These are recorded verbatim in the
+// index header and travel with the artifact, so a downloaded pair names the
+// model it needs and is queried the way it was built.
+constexpr std::array<OptionSpec, 4> descriptor_options{{
+    {"--model-source", "URI",
+     "model origin recorded in the index, e.g. hf:OWNER/REPO/FILE"},
+    {"--document-prefix", "TEXT",
+     "prepended to every chunk before embedding, and on rerank"},
+    {"--query-prefix", "TEXT", "prepended to the query at search time"},
+    {"--card", "KEY=VALUE", "artifact card entry; repeatable"},
+}};
+
+constexpr std::array<OptionSpec, 5> pull_options{{
+    {"--manifest", "FILE",
+     "LEANNMF1 manifest; turns the plan into exact digests"},
+    {"--revision", "REV", "repository revision (default main)"},
+    {"--dest", "DIR", "directory the plan downloads into (default .)"},
+    {"--format", "text|json", "output format (default text)"},
+    {"--help", "", "print this help and exit"},
+}};
+
+constexpr std::array<OptionSpec, 4> verify_options{{
+    {"--index", "PREFIX", "artifact prefix to verify (required)"},
+    {"--manifest", "FILE", "LEANNMF1 manifest to check sizes and digests"},
+    {"--format", "text|json", "output format (default text)"},
+    {"--help", "", "print this help and exit"},
+}};
+
+constexpr std::array<OptionGroup, 3> build_groups{{
     {"Build options", build_options},
     {"Embedding options (build also accepts --embedder cache)",
      embedding_options},
+    {"Artifact descriptor options", descriptor_options},
 }};
 
 constexpr std::array<OptionGroup, 4> search_groups{{
@@ -1552,7 +1547,15 @@ constexpr std::array<OptionGroup, 1> doctor_groups{{
     {"Options", doctor_options},
 }};
 
-constexpr std::array<CommandSpec, 5> command_specs{{
+constexpr std::array<OptionGroup, 1> pull_groups{{
+    {"Options", pull_options},
+}};
+
+constexpr std::array<OptionGroup, 1> verify_groups{{
+    {"Options", verify_options},
+}};
+
+constexpr std::array<CommandSpec, 7> command_specs{{
     {"build", "leann build --docs FILE --index PREFIX [options]",
      "Embed a corpus, prune the graph, and publish the artifact pair.",
      build_groups},
@@ -1566,6 +1569,15 @@ constexpr std::array<CommandSpec, 5> command_specs{{
     {"doctor", "leann doctor --index PREFIX [options]",
      "Report artifact health and leftovers from an interrupted build.",
      doctor_groups},
+    // Appended rather than inserted: suggest_option reports the first other
+    // command owning a flag, and the pinned "--top-k belongs to leann search"
+    // message depends on search still preceding bench.
+    {"pull", "leann pull hf:OWNER/NAME [options]",
+     "Print the exact commands that fetch a published index. Opens no socket.",
+     pull_groups, "hf:OWNER/NAME"},
+    {"verify", "leann verify --index PREFIX [options]",
+     "Check that an artifact pair loads and matches its manifest.",
+     verify_groups},
 }};
 
 [[nodiscard]] const CommandSpec * find_command(std::string_view name) {
@@ -1673,10 +1685,19 @@ void validate_arguments(const CommandSpec & command,
         reject_unknown(flag);
         throw std::invalid_argument("missing value for " + flag);
     }
-    if (!arguments.positional().empty()) {
+    if (command.positional_name.empty()) {
+        if (!arguments.positional().empty()) {
+            throw std::invalid_argument(
+                "unexpected argument for leann " + std::string(command.name) +
+                ": " + arguments.positional().front());
+        }
+    } else if (arguments.positional().size() > 1) {
+        // A second positional is almost always a quoting mistake, and taking
+        // the first silently would run against the wrong repository.
         throw std::invalid_argument(
-            "unexpected argument for leann " + std::string(command.name) +
-            ": " + arguments.positional().front());
+            "leann " + std::string(command.name) + " takes one " +
+            std::string(command.positional_name) + " argument, got " +
+            std::to_string(arguments.positional().size()));
     }
 }
 
@@ -1736,6 +1757,79 @@ void print_usage(std::ostream & output) {
     }
     output << "\n  leann <command> --help   options for one command\n"
            << "  leann --version          print the version and exit\n";
+}
+
+// Splits each --card KEY=VALUE on its first '=' and rejects anything that
+// would make the card ambiguous downstream. Control characters are refused
+// because `stats` writes the card as one line per entry and the manifest is
+// tab-separated; invalid UTF-8 is refused here rather than at --format json,
+// which would otherwise throw only after the build had already committed.
+[[nodiscard]] leann::ArtifactCard parse_card_entries(const Arguments & args) {
+    leann::ArtifactCard card;
+    for (const std::string & entry : args.all("--card")) {
+        const std::size_t separator = entry.find('=');
+        if (separator == std::string::npos) {
+            throw std::invalid_argument("--card must be KEY=VALUE, got: " +
+                                        entry);
+        }
+        std::string key = entry.substr(0, separator);
+        std::string value = entry.substr(separator + 1U);
+        if (key.empty()) {
+            throw std::invalid_argument("--card key must not be empty: " +
+                                        entry);
+        }
+        // Index::build enforces the same rules; rejecting here means the
+        // message names the offending flag instead of the header field.
+        for (const std::string_view field : {std::string_view(key),
+                                             std::string_view(value)}) {
+            if (leann::detail::has_control_characters(field)) {
+                throw std::invalid_argument(
+                    "--card must not contain control characters: " + key);
+            }
+            if (!is_valid_utf8(field)) {
+                throw std::invalid_argument(
+                    "--card must be valid UTF-8: " + key);
+            }
+        }
+        card.emplace_back(std::move(key), std::move(value));
+    }
+    return card;
+}
+
+// Descriptor inputs shared by build. Kept together so the validation order is
+// one place rather than scattered through command_build.
+struct DescriptorOptions {
+    std::string model_source;
+    std::string document_prefix;
+    std::string query_prefix;
+    leann::ArtifactCard card;
+};
+
+[[nodiscard]] DescriptorOptions descriptor_options_from(
+    const Arguments & args, bool uses_embedding_cache) {
+    DescriptorOptions options;
+    options.model_source = args.get("--model-source");
+    options.document_prefix = args.get("--document-prefix");
+    options.query_prefix = args.get("--query-prefix");
+    options.card = parse_card_entries(args);
+    // A LEANNBC2 cache holds vectors that were already computed over whatever
+    // text its producer chose. leann.cpp cannot apply a prefix to a finished
+    // vector, and the cache header has no prefix field to check against, so
+    // accepting this silently would record a prefix the vectors do not have.
+    //
+    // The advice matters: baking the prefix into the *cache* alone would still
+    // be wrong, because rerank never reads the cache — it re-embeds live from
+    // the document store and applies the index's recorded prefix, which would
+    // be empty. The prefix has to be in the corpus text itself, so that both
+    // the cached build vectors and every later recomputation see it.
+    if (uses_embedding_cache && !options.document_prefix.empty()) {
+        throw std::invalid_argument(
+            "--document-prefix cannot be applied to --embedder cache "
+            "vectors, which were already computed; put the prefix in the "
+            "--docs text itself and leave --document-prefix unset, so that "
+            "rerank recomputes the same text the cache was built from");
+    }
+    return options;
 }
 
 void command_build(const Arguments & args,
@@ -1823,6 +1917,11 @@ void command_build(const Arguments & args,
     config.embedding_batch_size =
         args.unsigned_value("--embedding-batch", config.embedding_batch_size);
     config.random_seed = args.unsigned_value("--seed", config.random_seed);
+    auto descriptor = descriptor_options_from(args, use_embedding_cache);
+    config.model_source = std::move(descriptor.model_source);
+    config.document_prefix = std::move(descriptor.document_prefix);
+    config.query_prefix = std::move(descriptor.query_prefix);
+    config.card = std::move(descriptor.card);
 
     ProgressReporter progress(args, "--progress");
     if (progress.enabled()) {
@@ -1979,6 +2078,23 @@ void command_stats(const Arguments & args) {
                    stats.dense_vector_bytes_avoided);
         json.field("pair_identity", stats.pair_identity);
         json.field("embedder", stats.embedder_fingerprint);
+        json.field("model_source", stats.model_source);
+        json.field("model_sha256", stats.model_sha256);
+        json.field("model_bytes", stats.model_bytes);
+        json.field("pooling_type",
+                   static_cast<std::uint64_t>(stats.pooling_type));
+        json.field("context_tokens",
+                   static_cast<std::uint64_t>(stats.context_tokens));
+        json.field("document_prefix", stats.document_prefix);
+        json.field("query_prefix", stats.query_prefix);
+        // Nested rather than flattened: a publisher-chosen key must not be
+        // able to appear at the top level, where a duplicate of an existing
+        // field would win last-write in every JSON reader.
+        json.begin_object_field("card");
+        for (const auto & [key, value] : stats.card) {
+            json.field(key, value);
+        }
+        json.end_object();
         json.end_object();
         document.commit();
         return;
@@ -2004,7 +2120,19 @@ void command_stats(const Arguments & args) {
               << "dense_vector_bytes_avoided="
               << stats.dense_vector_bytes_avoided << '\n'
               << "pair_identity=" << stats.pair_identity << '\n'
-              << "embedder=" << stats.embedder_fingerprint << '\n';
+              << "embedder=" << stats.embedder_fingerprint << '\n'
+              << "model_source=" << stats.model_source << '\n'
+              << "model_sha256=" << stats.model_sha256 << '\n'
+              << "model_bytes=" << stats.model_bytes << '\n'
+              << "pooling_type=" << stats.pooling_type << '\n'
+              << "context_tokens=" << stats.context_tokens << '\n'
+              << "document_prefix=" << stats.document_prefix << '\n'
+              << "query_prefix=" << stats.query_prefix << '\n';
+    // Card keys are namespaced and validated to hold no control characters,
+    // so an entry cannot forge a line or shadow a key a consumer reads.
+    for (const auto & [key, value] : stats.card) {
+        std::cout << "card_" << key << '=' << value << '\n';
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2364,6 +2492,649 @@ void command_doctor(const Arguments & args) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// LEANNMF1 manifests, pull, and verify
+//
+// A published index is two large files plus the model that produced them.
+// `pull` turns a repository name into the exact commands that fetch them and
+// the digests they must have; it deliberately opens no socket, so the binary
+// gains no HTTP client, no TLS surface, and no new dependency. `verify` is the
+// other half: it checks what actually landed on disk.
+//
+// The manifest is a tab-separated text format rather than JSON because the
+// repository takes no JSON parser dependency, and because a line-oriented
+// grammar is one that can be rejected precisely. Every deviation is an error:
+// there is no lenient mode, and an unknown key is a failure rather than
+// something to skip, so a newer manifest is never half-understood by an older
+// binary.
+// ---------------------------------------------------------------------------
+
+constexpr std::string_view manifest_magic = "LEANNMF1";
+
+struct ManifestFile {
+    std::string name;
+    std::uint64_t bytes = 0;
+    leann::detail::Sha256Digest digest{};
+};
+
+struct Manifest {
+    std::string repo;
+    std::string repo_type = "model";
+    std::string revision = "main";
+    std::string prefix;
+    std::vector<ManifestFile> files;
+    bool has_model = false;
+    ManifestFile model;
+    std::string model_source;
+};
+
+[[nodiscard]] std::vector<std::string_view> split_tabs(std::string_view line) {
+    std::vector<std::string_view> fields;
+    std::size_t begin = 0;
+    while (true) {
+        const std::size_t tab = line.find('\t', begin);
+        if (tab == std::string_view::npos) {
+            fields.push_back(line.substr(begin));
+            return fields;
+        }
+        fields.push_back(line.substr(begin, tab - begin));
+        begin = tab + 1U;
+    }
+}
+
+// Everything that reaches a printed command line goes through this allowlist.
+//
+// `pull` writes a URL into a single-quoted shell argument that a person is
+// meant to paste into a terminal. An apostrophe in a repository name would
+// close that quote, so the rest of the line stops being data and starts being
+// shell. Escaping is the wrong answer here: the values are repository IDs,
+// git revisions, and file names, none of which legitimately contain anything
+// outside this set, so refusing is both safer and simpler to reason about.
+constexpr std::string_view manifest_token_characters =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-/";
+
+void validate_manifest_token(std::string_view value, const char * field) {
+    if (value.empty()) {
+        throw std::runtime_error(std::string(field) + " is empty");
+    }
+    for (const char raw : value) {
+        if (manifest_token_characters.find(raw) == std::string_view::npos) {
+            throw std::runtime_error(
+                std::string("unsafe ") + field + ": " + std::string(value) +
+                " (allowed: letters, digits, and . _ - /)");
+        }
+    }
+    // A dot segment is inert in a name but not in a URL path. Every one of
+    // these values becomes a path component of the resolve URL, so a revision
+    // of "../../other/repo/resolve/main" would silently redirect every
+    // printed download to a repository the operator never named.
+    if (value.find("..") != std::string_view::npos) {
+        throw std::runtime_error(std::string("unsafe ") + field + ": " +
+                                 std::string(value) +
+                                 " (must not contain '..')");
+    }
+}
+
+// Rejects anything that could escape the destination directory as well.
+void validate_manifest_name(std::string_view name) {
+    validate_manifest_token(name, "manifest file name");
+    if (name.front() == '/') {
+        throw std::runtime_error("unsafe manifest file name: " +
+                                 std::string(name));
+    }
+}
+
+[[nodiscard]] std::uint64_t parse_manifest_bytes(std::string_view field) {
+    if (field.empty() ||
+        !std::all_of(field.begin(), field.end(),
+                     [](char c) { return c >= '0' && c <= '9'; })) {
+        throw std::runtime_error("manifest size is not a decimal count: " +
+                                 std::string(field));
+    }
+    std::uint64_t value = 0;
+    const auto [end, error] =
+        std::from_chars(field.data(), field.data() + field.size(), value);
+    if (error != std::errc{} || end != field.data() + field.size()) {
+        throw std::runtime_error("manifest size is out of range: " +
+                                 std::string(field));
+    }
+    return value;
+}
+
+[[nodiscard]] leann::detail::Sha256Digest
+parse_manifest_digest(std::string_view field) {
+    constexpr std::string_view prefix = "sha256:";
+    if (!field.starts_with(prefix)) {
+        throw std::runtime_error("manifest digest must start with sha256:, "
+                                 "got: " +
+                                 std::string(field));
+    }
+    const auto digest =
+        leann::detail::parse_hex_digest(field.substr(prefix.size()));
+    if (!digest) {
+        throw std::runtime_error(
+            "manifest digest must be 64 lowercase hex characters, got: " +
+            std::string(field));
+    }
+    return *digest;
+}
+
+[[nodiscard]] ManifestFile parse_manifest_file_record(
+    std::span<const std::string_view> fields, const char * record) {
+    if (fields.size() != 4U) {
+        throw std::runtime_error(std::string("manifest ") + record +
+                                 " record needs 3 fields");
+    }
+    ManifestFile entry;
+    entry.name = std::string(fields[1]);
+    entry.bytes = parse_manifest_bytes(fields[2]);
+    entry.digest = parse_manifest_digest(fields[3]);
+    return entry;
+}
+
+[[nodiscard]] Manifest read_manifest(const std::filesystem::path & path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot open manifest: " + path.string());
+    }
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(input, line)) {
+        // CR is rejected rather than stripped: a manifest is compared against
+        // digests, so a silently rewritten byte stream is the wrong default.
+        if (line.find('\r') != std::string::npos) {
+            throw std::runtime_error("manifest has CRLF line endings: " +
+                                     path.string());
+        }
+        lines.push_back(line);
+    }
+    if (lines.empty() || lines.front() != manifest_magic) {
+        throw std::runtime_error("not a LEANNMF1 manifest: " + path.string());
+    }
+
+    Manifest manifest;
+    bool saw_repo = false;
+    bool saw_type = false;
+    bool saw_revision = false;
+    bool saw_prefix = false;
+    std::unordered_set<std::string> names;
+    for (std::size_t i = 1; i < lines.size(); ++i) {
+        const std::string & raw = lines[i];
+        if (raw.empty()) {
+            throw std::runtime_error("manifest has a blank line: " +
+                                     path.string());
+        }
+        const auto fields = split_tabs(raw);
+        const std::string_view key = fields.front();
+        const auto once = [&](bool & seen) {
+            if (seen) {
+                throw std::runtime_error("duplicate manifest key: " +
+                                         std::string(key));
+            }
+            seen = true;
+            if (fields.size() != 2U || fields[1].empty()) {
+                throw std::runtime_error("manifest " + std::string(key) +
+                                         " needs exactly one value");
+            }
+            return std::string(fields[1]);
+        };
+        if (key == "repo") {
+            manifest.repo = once(saw_repo);
+            validate_manifest_token(manifest.repo, "manifest repo");
+        } else if (key == "type") {
+            manifest.repo_type = once(saw_type);
+            if (manifest.repo_type != "model" &&
+                manifest.repo_type != "dataset") {
+                throw std::runtime_error("manifest type must be model or "
+                                         "dataset, got: " +
+                                         manifest.repo_type);
+            }
+        } else if (key == "revision") {
+            manifest.revision = once(saw_revision);
+            validate_manifest_token(manifest.revision, "manifest revision");
+        } else if (key == "prefix") {
+            manifest.prefix = once(saw_prefix);
+            validate_manifest_name(manifest.prefix);
+        } else if (key == "file") {
+            auto entry = parse_manifest_file_record(fields, "file");
+            validate_manifest_name(entry.name);
+            if (!names.insert(entry.name).second) {
+                throw std::runtime_error("duplicate manifest file: " +
+                                         entry.name);
+            }
+            manifest.files.push_back(std::move(entry));
+        } else if (key == "model") {
+            if (manifest.has_model) {
+                throw std::runtime_error("duplicate manifest model record");
+            }
+            manifest.has_model = true;
+            manifest.model = parse_manifest_file_record(fields, "model");
+            manifest.model_source = manifest.model.name;
+            // A model origin legitimately contains characters the token
+            // allowlist excludes — "hf:owner/repo/file.gguf" has a colon —
+            // and it is only ever printed as prose, never inside a command.
+            // Control characters are still refused so the output stays
+            // line-oriented.
+            if (leann::detail::has_control_characters(manifest.model_source)) {
+                throw std::runtime_error("unsafe manifest model source: " +
+                                         manifest.model_source);
+            }
+            manifest.model.name.clear();
+        } else {
+            throw std::runtime_error("unknown manifest key: " +
+                                     std::string(key));
+        }
+    }
+
+    if (!saw_repo || !saw_prefix) {
+        throw std::runtime_error("manifest needs repo and prefix records: " +
+                                 path.string());
+    }
+    if (manifest.repo.find('/') == std::string::npos) {
+        throw std::runtime_error("manifest repo must be OWNER/NAME, got: " +
+                                 manifest.repo);
+    }
+    // The pair is the unit of publication, so a manifest that lists only one
+    // half of it describes something that cannot be searched.
+    for (const std::string & suffix : {".leann", ".docs"}) {
+        if (!names.contains(manifest.prefix + suffix)) {
+            throw std::runtime_error("manifest does not list " +
+                                     manifest.prefix + suffix);
+        }
+    }
+    return manifest;
+}
+
+[[nodiscard]] std::string resolve_url(const Manifest & manifest,
+                                      std::string_view name) {
+    std::string url = "https://huggingface.co/";
+    if (manifest.repo_type == "dataset") {
+        url += "datasets/";
+    }
+    url += manifest.repo;
+    url += "/resolve/";
+    url += manifest.revision;
+    url += '/';
+    url += name;
+    return url;
+}
+
+// -L is mandatory: a resolve URL answers with a redirect to the CDN. -f turns
+// an HTTP error into a nonzero exit instead of a file full of error markup.
+//
+// Both arguments are single-quoted. The URL is built only from allowlisted
+// tokens, but the destination comes from --dest, and a local directory may
+// legitimately contain a space; quoting is what makes that work. Neither can
+// contain an apostrophe — the allowlist forbids it for the URL and
+// validate_destination forbids it for the path — so the quoting holds.
+[[nodiscard]] std::string curl_line(const std::string & url,
+                                    const std::filesystem::path & destination) {
+    return "curl -fL --retry 3 -o '" + destination.string() + "' '" + url +
+           "'";
+}
+
+// Every printed path is quoted the same way, not just the ones inside a curl
+// line. --dest and --manifest may contain spaces, and a follow-up command that
+// only works for paths without them is a command that fails when pasted.
+[[nodiscard]] std::string shell_quoted(const std::string & value) {
+    return "'" + value + "'";
+}
+
+// Looser than the token allowlist because a destination is a local path, not
+// a URL component, but still strict enough that the printed command means what
+// it reads.
+void validate_destination(const std::filesystem::path & destination) {
+    const std::string text = destination.string();
+    if (text.empty()) {
+        throw std::invalid_argument("path argument is empty");
+    }
+    if (leann::detail::has_control_characters(text) ||
+        text.find('\'') != std::string::npos) {
+        throw std::invalid_argument(
+            "path must not contain quotes or control characters: " + text);
+    }
+}
+
+// Parses the `hf:OWNER/NAME` positional. Kept strict and tiny: the only
+// scheme is hf:, and `datasets/` is the one recognised qualifier.
+struct RepoSpec {
+    std::string repo;
+    std::string repo_type = "model";
+};
+
+[[nodiscard]] RepoSpec parse_repo_spec(std::string_view spec) {
+    constexpr std::string_view scheme = "hf:";
+    if (!spec.starts_with(scheme)) {
+        throw std::invalid_argument(
+            "repository must start with hf:, got: " + std::string(spec));
+    }
+    std::string_view rest = spec.substr(scheme.size());
+    RepoSpec result;
+    if (rest.starts_with("datasets/")) {
+        result.repo_type = "dataset";
+        rest = rest.substr(std::string_view("datasets/").size());
+    }
+    const std::size_t slash = rest.find('/');
+    if (slash == std::string_view::npos || slash == 0 ||
+        slash + 1U >= rest.size() ||
+        rest.find('/', slash + 1U) != std::string_view::npos) {
+        throw std::invalid_argument(
+            "repository must be hf:OWNER/NAME, got: " + std::string(spec));
+    }
+    // The repository name is interpolated into a printed shell command, so it
+    // is held to the same allowlist as everything read from a manifest.
+    try {
+        validate_manifest_token(rest, "repository");
+    } catch (const std::runtime_error & error) {
+        throw std::invalid_argument(error.what());
+    }
+    result.repo = std::string(rest);
+    return result;
+}
+
+void command_pull(const Arguments & args) {
+    const auto format = output_format(args);
+    if (args.positional().empty()) {
+        throw std::invalid_argument(
+            "leann pull needs a repository, for example hf:OWNER/NAME");
+    }
+    const RepoSpec spec = parse_repo_spec(args.positional().front());
+    const std::string revision = args.get("--revision", "main");
+    validate_manifest_token(revision, "--revision");
+    const auto destination = std::filesystem::path(args.get("--dest", "."));
+    validate_destination(destination);
+    const std::string manifest_argument = args.get("--manifest");
+    if (!manifest_argument.empty()) {
+        // Reprinted inside the quoted follow-up command, so it is held to the
+        // same rule as --dest.
+        validate_destination(manifest_argument);
+    }
+
+    Manifest manifest;
+    manifest.repo = spec.repo;
+    manifest.repo_type = spec.repo_type;
+    manifest.revision = revision;
+    bool have_manifest = false;
+    if (!manifest_argument.empty()) {
+        manifest = read_manifest(manifest_argument);
+        have_manifest = true;
+        if (manifest.repo != spec.repo) {
+            throw std::runtime_error("manifest describes " + manifest.repo +
+                                     " but the requested repository is " +
+                                     spec.repo);
+        }
+        // A model and a dataset repository of the same name are different
+        // namespaces on the Hub. Letting the manifest silently override the
+        // qualifier the operator typed would print downloads from a
+        // repository they did not ask for.
+        if (manifest.repo_type != spec.repo_type) {
+            throw std::runtime_error(
+                "manifest describes a " + manifest.repo_type +
+                " repository but " + std::string(args.positional().front()) +
+                " names a " + spec.repo_type + " repository");
+        }
+        // An explicit --revision is the caller's intent and overrides what the
+        // manifest recorded, which may be a branch that has since moved.
+        if (args.has("--revision")) {
+            manifest.revision = revision;
+        }
+    }
+
+    const std::string manifest_url = resolve_url(manifest, "leann.manifest");
+    std::uint64_t total_bytes = 0;
+    for (const ManifestFile & file : manifest.files) {
+        total_bytes += file.bytes;
+    }
+
+    if (format == OutputFormat::Json) {
+        JsonDocument document(std::cout);
+        JsonWriter & json = document.writer();
+        json.begin_object();
+        json.field("repo", manifest.repo);
+        json.field("repo_type", manifest.repo_type);
+        json.field("revision", manifest.revision);
+        json.field("manifest_url", manifest_url);
+        json.field("have_manifest", have_manifest);
+        json.field("fetches_anything", false);
+        if (have_manifest) {
+            json.field("prefix", manifest.prefix);
+            json.field("total_bytes", total_bytes);
+            json.begin_array("files");
+            for (const ManifestFile & file : manifest.files) {
+                json.begin_element();
+                json.field("name", file.name);
+                json.field("bytes", file.bytes);
+                json.field("sha256", leann::detail::hex_digest(file.digest));
+                json.field("url", resolve_url(manifest, file.name));
+                json.field("command",
+                           curl_line(resolve_url(manifest, file.name),
+                                     destination / file.name));
+                json.end_object();
+            }
+            json.end_array();
+            if (manifest.has_model) {
+                json.begin_object_field("model");
+                json.field("source", manifest.model_source);
+                json.field("bytes", manifest.model.bytes);
+                json.field("sha256",
+                           leann::detail::hex_digest(manifest.model.digest));
+                json.end_object();
+            }
+        }
+        json.end_object();
+        document.commit();
+        return;
+    }
+
+    std::cout << "repo: " << manifest.repo << " (" << manifest.repo_type
+              << " revision " << manifest.revision << ")\n";
+    if (!have_manifest) {
+        std::cout
+            << "step 1 — fetch the manifest:\n  "
+            << curl_line(manifest_url, destination / "leann.manifest")
+            << "\nstep 2 — print the checked plan:\n  leann pull "
+            << args.positional().front() << " --manifest "
+            << shell_quoted((destination / "leann.manifest").string()) << "\n";
+        return;
+    }
+
+    std::cout << "prefix: " << manifest.prefix << '\n'
+              << "total_bytes: " << total_bytes << '\n';
+    if (manifest.has_model) {
+        std::cout << "model: " << manifest.model_source << " ("
+                  << manifest.model.bytes << " bytes, sha256:"
+                  << leann::detail::hex_digest(manifest.model.digest) << ")\n";
+    }
+    std::cout << "download:\n";
+    for (const ManifestFile & file : manifest.files) {
+        std::cout << "  " << curl_line(resolve_url(manifest, file.name),
+                                       destination / file.name)
+                  << "\n  # " << file.bytes
+                  << " bytes, sha256:" << leann::detail::hex_digest(file.digest)
+                  << '\n';
+    }
+    std::cout << "then:\n  leann verify --index "
+              << shell_quoted((destination / manifest.prefix).string())
+              << " --manifest " << shell_quoted(manifest_argument) << '\n';
+}
+
+// The pair half of verify, shared in shape with doctor so the two report the
+// same fact in the same words rather than drifting into two vocabularies.
+struct VerifiedFile {
+    std::string name;
+    bool present = false;
+    bool size_matches = false;
+    bool digest_matches = false;
+    std::uint64_t expected_bytes = 0;
+    std::uint64_t actual_bytes = 0;
+};
+
+void command_verify(const Arguments & args) {
+    const auto format = output_format(args);
+    const auto prefix = std::filesystem::path(args.require("--index"));
+    const std::string manifest_argument = args.get("--manifest");
+
+    bool pair_valid = false;
+    std::string pair_error;
+    std::string pair_identity;
+    std::string model_source;
+    std::string model_sha256;
+    try {
+        const auto index =
+            leann::Index::load(leann::index_file_from_prefix(prefix));
+        auto documents =
+            leann::DocumentStore::open(leann::documents_file_from_prefix(prefix));
+        index.validate_document_store(documents);
+        const auto stats = index.stats();
+        pair_identity = stats.pair_identity;
+        model_source = stats.model_source;
+        model_sha256 = stats.model_sha256;
+        pair_valid = true;
+    } catch (const std::exception & error) {
+        pair_error = error.what();
+    }
+
+    std::vector<VerifiedFile> checked;
+    bool manifest_matches = true;
+    std::string model_disagreement;
+    if (!manifest_argument.empty()) {
+        const Manifest manifest = read_manifest(manifest_argument);
+        // The index says which model built it and the manifest says which
+        // model to fetch. If those disagree, following the manifest gets a
+        // model the index will refuse — better to say so here than to let it
+        // surface later as a fingerprint mismatch on the first query.
+        if (pair_valid && manifest.has_model) {
+            const std::string manifest_digest =
+                leann::detail::hex_digest(manifest.model.digest);
+            if (!model_source.empty() &&
+                manifest.model_source != model_source) {
+                model_disagreement = "manifest names model " +
+                                     manifest.model_source +
+                                     " but the index was built from " +
+                                     model_source;
+            } else if (model_sha256 != std::string(64, '0') &&
+                       manifest_digest != model_sha256) {
+                model_disagreement =
+                    "manifest model digest " + manifest_digest +
+                    " does not match the index's " + model_sha256;
+            }
+            if (!model_disagreement.empty()) {
+                manifest_matches = false;
+            }
+        }
+        // Fail closed rather than verifying one pair against another pair's
+        // digests, which would report a mismatch that reads like corruption.
+        if (manifest.prefix != prefix.filename().string()) {
+            throw std::runtime_error(
+                "manifest describes prefix '" + manifest.prefix +
+                "' but --index names '" + prefix.filename().string() + "'");
+        }
+        // Named files are resolved beside the artifact prefix, not beside the
+        // manifest: the manifest may have been fetched anywhere, but the pair
+        // it describes is the one --index points at.
+        const auto directory = prefix.parent_path();
+        for (const ManifestFile & file : manifest.files) {
+            VerifiedFile result;
+            result.name = file.name;
+            result.expected_bytes = file.bytes;
+            const auto path = directory / file.name;
+            std::error_code code;
+            const auto size = std::filesystem::file_size(path, code);
+            if (code) {
+                manifest_matches = false;
+                checked.push_back(std::move(result));
+                continue;
+            }
+            result.present = true;
+            result.actual_bytes = static_cast<std::uint64_t>(size);
+            result.size_matches = result.actual_bytes == file.bytes;
+            // Only digest a file whose size already agrees: a mismatched size
+            // is already a failure and hashing gigabytes proves nothing more.
+            result.digest_matches =
+                result.size_matches &&
+                leann::detail::sha256_file_prefix(path, result.actual_bytes) ==
+                    file.digest;
+            if (!result.digest_matches) {
+                manifest_matches = false;
+            }
+            checked.push_back(std::move(result));
+        }
+    }
+
+    const bool ok = pair_valid && manifest_matches;
+    if (format == OutputFormat::Json) {
+        JsonDocument document(std::cout);
+        JsonWriter & json = document.writer();
+        json.begin_object();
+        json.field("pair_valid", pair_valid);
+        if (pair_valid) {
+            json.field("pair_identity", pair_identity);
+            json.field("model_source", model_source);
+        } else {
+            json.field("pair_error", pair_error);
+        }
+        json.field("checked_manifest", !manifest_argument.empty());
+        json.field("model_disagreement", model_disagreement);
+        json.begin_array("files");
+        for (const VerifiedFile & file : checked) {
+            json.begin_element();
+            json.field("name", file.name);
+            json.field("present", file.present);
+            json.field("expected_bytes", file.expected_bytes);
+            json.field("actual_bytes", file.actual_bytes);
+            json.field("digest_matches", file.digest_matches);
+            json.end_object();
+        }
+        json.end_array();
+        json.field("ok", ok);
+        json.end_object();
+        document.commit();
+    } else {
+        std::cout << "pair: " << (pair_valid ? "valid" : "unusable");
+        if (pair_valid) {
+            std::cout << " (identity " << pair_identity << ")";
+        } else {
+            std::cout << " — " << pair_error;
+        }
+        std::cout << '\n';
+        if (pair_valid && !model_source.empty()) {
+            std::cout << "model_source: " << model_source << '\n';
+        }
+        for (const VerifiedFile & file : checked) {
+            std::cout << "file: " << file.name << ' ';
+            if (!file.present) {
+                std::cout << "missing\n";
+            } else if (!file.size_matches) {
+                std::cout << "size mismatch (expected " << file.expected_bytes
+                          << ", got " << file.actual_bytes << ")\n";
+            } else if (!file.digest_matches) {
+                std::cout << "digest mismatch\n";
+            } else {
+                std::cout << "ok\n";
+            }
+        }
+        if (!model_disagreement.empty()) {
+            std::cout << "model: " << model_disagreement << '\n';
+        }
+        if (manifest_argument.empty()) {
+            std::cout << "manifest: not checked\n";
+        }
+        std::cout << "verify: " << (ok ? "ok" : "failed") << '\n';
+    }
+    if (!ok) {
+        // A failed verification must not exit 0; the whole point is that a
+        // script can branch on it.
+        if (!pair_valid) {
+            throw std::runtime_error("artifact pair does not load: " +
+                                     pair_error);
+        }
+        throw std::runtime_error(
+            model_disagreement.empty()
+                ? "manifest does not match the files on disk"
+                : model_disagreement);
+    }
+}
+
 std::vector<std::uint32_t>
 exact_top_k(std::span<const float> query,
             const std::vector<leann::Embedding> & corpus,
@@ -2633,6 +3404,22 @@ void command_bench(const Arguments & args,
     auto documents =
         leann::DocumentStore::open(documents_path);
     index.validate_document_store(documents);
+    // A precomputed cache holds vectors somebody else embedded, and neither
+    // LEANNBC2 nor the ground-truth cache records the prefix its producer
+    // used. Against a prefixed index that mismatch is invisible: nothing
+    // throws, recall just drops. Refusing the combination is the only way to
+    // keep "measured recall" meaning what it says.
+    if (!query_cache_argument.empty() && !index.query_prefix().empty()) {
+        throw std::invalid_argument(
+            "--query-embedding-cache cannot be used with an index that has a "
+            "query prefix; the cached vectors do not record one");
+    }
+    if (!ground_truth_cache_argument.empty() &&
+        !index.document_prefix().empty()) {
+        throw std::invalid_argument(
+            "--ground-truth-cache cannot be used with an index that has a "
+            "document prefix; the cached vectors do not record one");
+    }
     auto embedder = make_embedder(args);
     std::vector<std::string> queries;
     std::optional<std::vector<leann::Embedding>>
@@ -2750,6 +3537,14 @@ void command_bench(const Arguments & args,
                 std::iota(ids.begin(), ids.end(),
                           static_cast<std::uint32_t>(begin));
                 auto batch_documents = documents.read_many(ids);
+                // Ground truth must be computed in the same space the index
+                // was built in. bench calls search_embedding directly, so
+                // Index cannot apply the prefix on its behalf here.
+                if (!index.document_prefix().empty()) {
+                    for (std::string & text : batch_documents) {
+                        text.insert(0, index.document_prefix());
+                    }
+                }
                 auto batch_embeddings =
                     embedder->embed(batch_documents);
                 if (batch_embeddings.size() !=
@@ -2826,8 +3621,12 @@ void command_bench(const Arguments & args,
         if (cached_query_embeddings) {
             return (*cached_query_embeddings)[query_index];
         }
+        // Same reason as the ground-truth pass: search_embedding receives a
+        // finished vector, so the index's query prefix has to be applied here.
+        // A --query-embedding-cache is exempt only because its vectors already
+        // exist; nothing in C++ can check what text produced them.
         const std::array<std::string, 1> query_batch{
-            queries[query_index]};
+            index.query_prefix() + queries[query_index]};
         auto embedded = embedder->embed(query_batch);
         if (embedded.size() != 1 ||
             embedded.front().size() != embedder->dimension()) {
@@ -3153,6 +3952,12 @@ int main(int argc, char ** argv) {
             command_bench(args, install_handlers());
         } else if (command == "doctor") {
             command_doctor(args);
+        } else if (command == "pull") {
+            // No install_handlers: neither command polls for cancellation, so
+            // catching a signal would only make them uninterruptible.
+            command_pull(args);
+        } else if (command == "verify") {
+            command_verify(args);
         } else {
             throw std::invalid_argument("unknown command: " + command);
         }

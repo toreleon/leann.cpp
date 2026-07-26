@@ -86,8 +86,9 @@ Four layers, each with a different dependency budget:
   `approximate_scan_limit` (100k nodes) or a bounded base-graph beam above it →
   read the selected raw chunks → batched embedder recomputation → exact cosine
   top-k. Returned distances are always exact, never approximate.
-- **`app/main.cpp` — the CLI** (`build`, `search`, `stats`, `bench`,
-  `doctor`). One ~3000 line file: an `Arguments` parser, the `command_specs`
+- **`app/main.cpp` — the CLI** (`build`, `search`, `stats`, `bench`, `doctor`,
+  `pull`, `verify`). One ~3800 line file: an `Arguments` parser, the
+  `command_specs`
   option tables, a `JsonWriter`, the `LEANNBC2` embedding-cache and
   `LEANN_GT1` ground-truth readers, and the benchmark loop all live in an
   anonymous namespace here. `tests/test_cli_cache.cpp` does
@@ -115,6 +116,10 @@ Four layers, each with a different dependency budget:
   rejects a report with a missing sweep point, artifact hash, parity check, or
   ranked result ID and never interpolates. `docs/BENCHMARK_EVALUATION_PLAN.md`
   is the operational plan; `README.md` has the command sequence.
+  The layer now has a second job: `chunk_corpus.py` and `publish_hf_index.py`
+  prepare and package a shareable index. Both are stdlib-only (not even numpy),
+  `pack` opens no socket, `push` is gated on an explicit `--yes` plus a token,
+  and pack output must stay byte-identical across runs.
 
 ## Invariants that tests actively defend
 
@@ -133,13 +138,28 @@ Breaking any of these should surface in `leann_persistence_tests` or
   pair, publish documents first, rename the index **last** as the commit marker,
   roll back documents-before-index on error. If the pair commits but cleanup
   fails, report that distinct "committed; cleanup required" state.
-- Formats are versioned and reject older artifacts (`LEANNC03` / `LEANDC02`).
+- Formats are versioned and reject older artifacts (`LEANNC04` / `LEANDC02`).
+  A `LEANNC03` index is recognised by magic and rejected with a message naming
+  the migration boundary; there is no in-place upgrade.
   A format change means bumping magic + version, updating the `DESIGN.md` tables,
   and stating the migration boundary — never silently accepting both shapes.
 - NaN/infinity is rejected before it can reach an integer conversion, heap
   insert, or sort — in build/search ratios, query vectors, backend embeddings,
   PQ intermediates, and exact distances. Tiny-but-positive rerank ratios saturate
   the beam at index size instead of overflowing.
+- Document/query prefixes are index state applied by `Index` at its three embed
+  sites; they are deliberately not in the fingerprint (a live embedder cannot
+  know them without first loading the index) and never reach the document store
+  or the corpus identity. A caller that embeds its own query and uses
+  `search_embedding` must apply `query_prefix()` itself — `bench` does.
+  Prefix + precomputed-vector combinations are rejected, not documented away.
+- Descriptor strings (model source, prefixes, card keys and values) are
+  length-capped, control-character-free, and valid UTF-8, checked identically
+  on write and on read. Nothing time- or host-derived is ever written into an
+  artifact.
+- `leann pull` opens no socket: it prints commands and digests. `LEANNMF1` is
+  parsed fail-closed with no lenient mode, and the C++ reader and the Python
+  writer in `scripts/publish_hf_index.py` must stay in step.
 - Build and search embedder fingerprints must match. The fingerprint includes
   `--gpu-layers` (CPU and Metal embeddings are not bit-identical) but is a
   configuration guardrail, not a cryptographic model/backend hash.

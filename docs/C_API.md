@@ -5,10 +5,25 @@ through an embedding callback owned by the application. The public header,
 `leann/leann.h`, is valid C11, has no C++ or llama.cpp types, and exposes only
 opaque handles.
 
-This API does not build or mutate indexes, load or own an embedding model, run
-a server, or change the `.leann`/`.docs` formats. Build an index with the C++
-API or CLI first. A pinned llama.cpp callback example is a follow-up; the ABI
-is intentionally independent of any llama.cpp revision.
+This API does not build or mutate indexes, load or own an embedding model, or
+run a server. Build an index with the C++ API or CLI first. A pinned llama.cpp
+callback example is a follow-up; the ABI is intentionally independent of any
+llama.cpp revision.
+
+`LEANN_C_API_VERSION` remains 1 across the `.leann` v4 format change. The
+format grew an embedder descriptor, but no C type changed size, no entry point
+was added, and no existing struct was reordered, so an already-compiled v1
+caller keeps working — it simply cannot read the new metadata. Bumping the
+macro would have been the breaking option: `leann_searcher_open()` compares
+`api_version` with `!=`, so a bump without a matching range check would reject
+every existing caller.
+
+One behaviour does change, and a caller that inspects the texts it is given
+will see it. If an index records a document or query prefix, those prefixes
+are applied by `Index` before `leann_embed_batch_fn` is called, so the callback
+now receives prefixed text. Result text is unaffected: it comes from the
+document store and is still the raw chunk. Indexes built without prefixes —
+which is the default — are unchanged in both respects.
 
 ## Lifecycle
 

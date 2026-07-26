@@ -1,5 +1,23 @@
 # Roadmap from spike to repository-grade system
 
+## Completed in v0.5 shareable indexes
+
+- An embedder descriptor in the `.leann` v4 header: the model's origin string,
+  the SHA-256 and byte size of the GGUF used at build time, its pooling mode
+  and context budget, and a free-form artifact card of publisher key/value
+  pairs, all validated identically on write and on read.
+- Document and query prefixes as index state, applied by `Index` at its three
+  embedding sites, kept out of the document store and the corpus identity, and
+  refused in the combinations where precomputed vectors make them a silent
+  ranking error rather than an error.
+- `leann pull`, which turns a repository name into the exact fetch commands and
+  the digests they must produce while opening no socket, and `leann verify`,
+  which is a gate rather than a report and exits nonzero on any mismatch.
+- The `LEANNMF1` manifest format, parsed fail-closed by the CLI and written by
+  `scripts/publish_hf_index.py`.
+- A dependency-light chunker and Hugging Face publisher, with a `pack` path
+  that opens no socket and produces byte-identical output across runs.
+
 ## Completed in v0.4 operability
 
 - Strict per-command option validation with correction hints, replacing a
@@ -28,7 +46,7 @@
 - Unique temporary/backup artifacts, same-prefix build locks, index-last
   fail-closed publication, rollback, and dedicated persistence tests.
 - Explicit migration and power-loss boundaries for the `.leann` v3 and
-  `.docs` v2 formats.
+  `.docs` v2 formats (`.leann` is v4 as of the shareable-index work below).
 - Fail-fast finite-value validation across build, query, PQ, and exact-ranking
   boundaries.
 - Const, synchronized shared document reads with deterministic concurrency and

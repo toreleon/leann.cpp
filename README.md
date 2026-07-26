@@ -42,6 +42,9 @@ Reproduce it with the [hash-backend quick start](#quick-start) below.
 - Exact llama.cpp recomputation and ranking of only the selected candidates.
 - Batched on-demand recomputation.
 - A non-cryptographic model/config fingerprint guardrail.
+- A self-describing artifact: the index records which GGUF built it, that
+  file's SHA-256, and the document/query prefixes it must be searched with, so
+  a downloaded pair names what it needs instead of only failing a comparison.
 - SHA-256-protected indexes, lazy per-chunk CRC32C document validation, shared
   corpus identity, and fail-closed pair publication.
 - Fail-fast rejection of non-finite configuration, query, embedding, PQ, and
@@ -51,8 +54,8 @@ Reproduce it with the [hash-backend quick start](#quick-start) below.
 - A versioned, dependency-free C11 read/search API with opaque handles,
   caller-owned batched embedding callbacks, owned result bytes, and
   thread-local errors.
-- `build`, `search`, `stats`, exact-ground-truth `bench`, and `doctor`
-  commands, including a same-embedding dense HNSW baseline.
+- `build`, `search`, `stats`, exact-ground-truth `bench`, `doctor`, `pull`, and
+  `verify` commands, including a same-embedding dense HNSW baseline.
 - Strict per-command option validation with correction hints, per-command
   help, and opt-in `--format json` on every command. See
   [the CLI guide](docs/CLI.md).
@@ -121,8 +124,11 @@ Build and query with one GGUF embedding model:
 
 The same model description/size, pooling metadata, and `--gpu-layers` setting
 must be used for build and search. This guardrail catches common configuration
-mismatches, but it does not yet cryptographically identify the GGUF weights,
-llama.cpp build, or Metal/CUDA/Vulkan backend.
+mismatches, but it does not identify the llama.cpp build or the
+Metal/CUDA/Vulkan backend. The index separately **records** the SHA-256 of the
+GGUF file it was built from, which is what lets a downloaded copy be checked —
+but that digest is metadata, not an enforced check: nothing verifies that the
+model actually in use hashes to it.
 `--ctx` is the token capacity per document sequence; `--parallel` sequences
 share a llama.cpp context sized as their product.
 `--pq-subquantizers` must evenly divide the embedding dimension. The default
@@ -319,6 +325,9 @@ python3 scripts/validate_embedding_parity.py --help
 python3 scripts/attest_embedding_endpoint.py capture --help
 python3 scripts/attest_embedding_endpoint.py finalize --help
 python3 scripts/collect_large_scale_results.py --help
+python3 scripts/chunk_corpus.py --help
+python3 scripts/publish_hf_index.py pack --help
+python3 scripts/publish_hf_index.py push --help
 ```
 
 For the final two-tier publication, pass every native, official-cached, and
@@ -430,8 +439,12 @@ compare index bytes with raw document bytes and the omitted dense-vector size.
 
 ### Artifact integrity and format migration
 
-The `.leann` v3 and `.docs` v2 formats deliberately reject older spike
-artifacts; rebuild a v0.2 index from its source chunks. Both new artifacts
+The `.leann` v4 and `.docs` v2 formats deliberately reject older spike
+artifacts. A `LEANNC03` index is recognised by magic and rejected with a
+message naming the boundary rather than reported as "not a leann.cpp index";
+there is no in-place upgrade, because the embedder descriptor and the prefixes
+it added are load-bearing for search. Rebuild a v3 pair from its source
+chunks. Both new artifacts
 carry the same deterministic 256-bit identity derived from ordered chunk
 lengths and bytes. `search`, `bench`, and `stats` reject a mixed pair before
 query embedding or corpus scanning.
@@ -452,6 +465,52 @@ builders and inspect any `.bak.*` artifacts before removing a stale lock.
 If the new pair commits but backup/lock cleanup fails, `build` reports that
 distinct committed state and retains the recoverable path instead of silently
 claiming cleanup success.
+
+### Shareable indexes
+
+Because the dense vectors are discarded, a leann.cpp index is small enough to
+hand to somebody else. That only works if the artifact says what it needs, so
+the `.leann` header carries an embedder descriptor: the model's origin string,
+the SHA-256 and size of the GGUF file used at build time, its pooling mode and
+context budget, the document and query prefixes, and a free-form artifact card
+of publisher key/value pairs.
+
+The prefixes are applied by `Index` itself at all three embedding sites, so a
+downloaded pair is queried the way its publisher built it without the caller
+knowing anything. They never reach the document store, so a search result is
+the chunk rather than the chunk with a prompt glued to it.
+
+```console
+$ leann build --docs corpus.txt --index corpus \
+    --embedder llama --model nomic-embed-text-v1.5.Q4_K_M.gguf --ctx 1280 \
+    --model-source 'hf:nomic-ai/nomic-embed-text-v1.5-GGUF/nomic-embed-text-v1.5.Q4_K_M.gguf' \
+    --document-prefix 'search_document: ' --query-prefix 'search_query: ' \
+    --card license=apache-2.0 --card corpus='what this is'
+$ python3 scripts/publish_hf_index.py pack --index corpus \
+    --output upload --repo OWNER/NAME --leann ./leann
+$ HF_TOKEN=... python3 scripts/publish_hf_index.py push \
+    --directory upload --repo OWNER/NAME --create-repo --yes
+```
+
+On the other side, `leann pull` prints the exact `curl` commands and the
+digests they must produce, and `leann verify` checks what landed:
+
+```console
+$ leann pull hf:OWNER/NAME --manifest leann.manifest
+$ leann verify --index corpus --manifest leann.manifest
+```
+
+`pull` opens no socket. That is what keeps the binary free of an HTTP client
+and a TLS dependency, and it is also exactly why `pull` alone establishes
+nothing: `verify` is the step that checks anything. See
+[docs/CLI.md](docs/CLI.md) for the `LEANNMF1` manifest grammar and
+[docs/PUBLISHING.md](docs/PUBLISHING.md) for the end-to-end walkthrough.
+
+Like `LEANNBC2`, a manifest is not self-authenticating. It is unsigned, there
+is no trust root and no revocation, and its digests are only as trustworthy as
+the channel that delivered it. A match establishes that the bytes are the ones
+the publisher recorded — not that the publisher is trustworthy, and not that
+the index retrieves well.
 
 ### Concurrency and numeric safety
 
@@ -482,6 +541,21 @@ it is still a research spike rather than the paper's complete system:
 - no automatic recovery command yet for stale locks/backups after a
   machine-level interruption;
 - no bundled service mode, cancellation, or request scheduler.
+
+The shareable-index work has its own boundaries, and they are not small:
+
+- `leann pull` prints commands and opens no socket, so the binary fetches
+  nothing, retries nothing, and verifies nothing until `verify` runs;
+- a `LEANNMF1` manifest is unsigned, with no trust root and no revocation;
+- a matching digest proves the bytes are the ones the publisher recorded, not
+  that the publisher is trustworthy or that the index is any good;
+- the recorded model SHA-256 is metadata the loader does not enforce, and the
+  recorded context-token budget is not checked against the live embedder;
+- a recorded artifact digest pins one build, not one corpus: embeddings are
+  not bit-identical across backends or batch shapes, so rebuilding the same
+  chunks elsewhere yields a valid index with different bytes;
+- `scripts/publish_hf_index.py pack` is exercised by tests; its `push` path has
+  not been run against the live Hugging Face API from this repository.
 
 Those differences matter. Do not claim the paper's “under 5%” or recall/latency
 numbers from this code without measuring them on the target corpus and model.

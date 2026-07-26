@@ -144,6 +144,42 @@ class CountingEmbedder final : public leann::Embedder {
     leann::HashEmbedder inner_{64};
 };
 
+// Reports a descriptor whose every field holds a distinct, recognisable value.
+// The two u32 fields in particular must differ: a write/read transposition of
+// two same-width fields preserves the file size, so the terminal
+// "unexpected trailing bytes" check cannot catch it and only a value
+// comparison can.
+class DescribedEmbedder final : public leann::Embedder {
+  public:
+    [[nodiscard]] std::size_t dimension() const noexcept override {
+        return inner_.dimension();
+    }
+
+    [[nodiscard]] std::string fingerprint() const override {
+        return inner_.fingerprint();
+    }
+
+    [[nodiscard]] leann::EmbedderDescriptor descriptor() const override {
+        leann::EmbedderDescriptor described;
+        described.source = "hf:owner/repo/model.gguf";
+        for (std::size_t i = 0; i < described.sha256.size(); ++i) {
+            described.sha256[i] = static_cast<std::uint8_t>(i + 1U);
+        }
+        described.bytes = 84106624U;
+        described.pooling_type = 1U;
+        described.context_tokens = 512U;
+        return described;
+    }
+
+    [[nodiscard]] std::vector<leann::Embedding>
+    embed(std::span<const std::string> texts) override {
+        return inner_.embed(texts);
+    }
+
+  private:
+    leann::HashEmbedder inner_{64};
+};
+
 class ThrowingEmbedder final : public leann::Embedder {
   public:
     [[nodiscard]] std::size_t dimension() const noexcept override { return 64; }
@@ -759,6 +795,165 @@ int main() {
         check(concurrent_documents.read(0) == corpus_a[0],
               "winning concurrent builder publishes its own documents");
         check_no_build_residue(directory);
+
+        // -------------------------------------------------------------
+        // Embedder descriptor, artifact card, and prefixes (LEANNC04).
+        // -------------------------------------------------------------
+        {
+            auto descriptor_config = build_config();
+            descriptor_config.model_source = "hf:owner/repo/model.gguf";
+            // Deliberately different lengths AND different content, so a
+            // write/read transposition of the two prefix fields cannot round
+            // trip cleanly. The same reasoning applies to the two u32s below,
+            // which are read back as distinct values.
+            descriptor_config.document_prefix = "search_document: ";
+            descriptor_config.query_prefix = "q: ";
+            descriptor_config.card = {{"license", "apache-2.0"},
+                                      {"corpus", "persistence fixture"}};
+
+            const auto descriptor_prefix = directory / "descriptor";
+            DescribedEmbedder described_embedder;
+            leann::Index::build(
+                leann::index_file_from_prefix(descriptor_prefix),
+                leann::documents_file_from_prefix(descriptor_prefix), corpus_a,
+                described_embedder, descriptor_config);
+            const auto descriptor_index = leann::Index::load(
+                leann::index_file_from_prefix(descriptor_prefix));
+            const auto descriptor_stats = descriptor_index.stats();
+            check(descriptor_stats.model_source == "hf:owner/repo/model.gguf",
+                  "model source round trips");
+            check(descriptor_stats.document_prefix == "search_document: ",
+                  "document prefix round trips");
+            check(descriptor_stats.query_prefix == "q: ",
+                  "query prefix round trips");
+            check(descriptor_index.document_prefix() == "search_document: " &&
+                      descriptor_index.query_prefix() == "q: ",
+                  "prefix accessors agree with stats");
+            check(descriptor_stats.card.size() == 2U &&
+                      descriptor_stats.card[0].first == "license" &&
+                      descriptor_stats.card[0].second == "apache-2.0" &&
+                      descriptor_stats.card[1].first == "corpus",
+                  "artifact card round trips in insertion order");
+            // Distinct values, checked individually: the two u32 fields are
+            // the same width, so a transposed write/read pair would preserve
+            // the file size and survive every structural check.
+            check(descriptor_stats.pooling_type == 1U,
+                  "pooling type round trips");
+            check(descriptor_stats.context_tokens == 512U,
+                  "context tokens round trips, not transposed with pooling");
+            check(descriptor_stats.model_bytes == 84106624U,
+                  "model size round trips");
+            check(descriptor_stats.model_sha256 ==
+                      "0102030405060708090a0b0c0d0e0f10"
+                      "1112131415161718191a1b1c1d1e1f20",
+                  "model digest round trips byte for byte and in order");
+
+            // The prefix must never reach the document store: pair identity is
+            // derived from the raw chunk bytes, and a search result must be
+            // the chunk, not the chunk with a prompt glued to it.
+            auto descriptor_documents = leann::DocumentStore::open(
+                leann::documents_file_from_prefix(descriptor_prefix));
+            check(descriptor_documents.read(0) == corpus_a[0],
+                  "document prefix stays out of the document store");
+
+            // An index built with no descriptor keeps the empty defaults, and
+            // an embedder with no model file describes itself with the
+            // all-zero "absent" digest rather than a hash of nothing.
+            const auto plain_index = leann::Index::load(
+                leann::index_file_from_prefix(stable_prefix));
+            const auto plain_stats = plain_index.stats();
+            check(plain_index.document_prefix().empty() &&
+                      plain_index.query_prefix().empty() &&
+                      plain_stats.card.empty(),
+                  "an index built without a descriptor carries empty defaults");
+            check(plain_stats.model_sha256 == std::string(64, '0') &&
+                      plain_stats.model_bytes == 0 &&
+                      plain_stats.model_source.empty(),
+                  "an embedder with no model file reports an absent model");
+        }
+
+        {
+            // Write-side rejections. Each must fail before the index file is
+            // created, so a bad descriptor never leaves a partial artifact.
+            const auto rejected_prefix = directory / "rejected";
+            const auto attempt = [&](leann::BuildConfig config) {
+                return [&, config] {
+                    leann::Index::build(
+                        leann::index_file_from_prefix(rejected_prefix),
+                        leann::documents_file_from_prefix(rejected_prefix),
+                        corpus_a, build_embedder, config);
+                };
+            };
+            auto duplicate = build_config();
+            duplicate.card = {{"license", "a"}, {"license", "b"}};
+            expect_error(attempt(duplicate), "duplicate artifact card key");
+
+            auto control = build_config();
+            control.card = {{"note", "one\ntwo"}};
+            expect_error(attempt(control), "must not contain control");
+
+            auto newline_prefix = build_config();
+            newline_prefix.document_prefix = "bad\nprefix";
+            expect_error(attempt(newline_prefix), "must not contain control");
+
+            auto long_source = build_config();
+            long_source.model_source =
+                std::string(leann::max_model_source_bytes + 1U, 'x');
+            expect_error(attempt(long_source), "model source is too long");
+
+            auto long_prefix = build_config();
+            long_prefix.query_prefix =
+                std::string(leann::max_prefix_bytes + 1U, 'x');
+            expect_error(attempt(long_prefix), "query prefix is too long");
+
+            auto many_entries = build_config();
+            for (std::size_t i = 0; i <= leann::max_card_entries; ++i) {
+                many_entries.card.emplace_back("k" + std::to_string(i), "v");
+            }
+            expect_error(attempt(many_entries),
+                         "artifact card has too many entries");
+
+            auto invalid_utf8 = build_config();
+            invalid_utf8.card = {{"note", std::string("\xff\xfe")}};
+            expect_error(attempt(invalid_utf8), "must be valid UTF-8");
+
+            check(!std::filesystem::exists(
+                      leann::index_file_from_prefix(rejected_prefix)),
+                  "a rejected descriptor publishes no index");
+            check_no_build_residue(directory);
+        }
+
+        {
+            // A LEANNC03 artifact must name the migration boundary rather than
+            // report that it is not a leann.cpp index at all. Nothing else in
+            // the tree covers old-version rejection.
+            const auto legacy_index = directory / "legacy.leann";
+            {
+                std::ofstream output(legacy_index,
+                                     std::ios::binary | std::ios::trunc);
+                output.write("LEANNC03", 8);
+                write_le<std::uint32_t>(output, 3U);
+                write_le<std::uint32_t>(output, 1U);
+                output.close();
+            }
+            leann::detail::append_sha256_footer(legacy_index);
+            expect_error([&] { (void)leann::Index::load(legacy_index); },
+                         "LEANNC03 format");
+            expect_error([&] { (void)leann::Index::load(legacy_index); },
+                         "rebuild the pair");
+
+            const auto alien_index = directory / "alien.leann";
+            {
+                std::ofstream output(alien_index,
+                                     std::ios::binary | std::ios::trunc);
+                output.write("NOTLEANN", 8);
+                write_le<std::uint32_t>(output, 4U);
+                output.close();
+            }
+            leann::detail::append_sha256_footer(alien_index);
+            expect_error([&] { (void)leann::Index::load(alien_index); },
+                         "not a leann.cpp index");
+        }
 
         std::filesystem::remove_all(directory);
         std::cout << "all leann.cpp persistence tests passed\n";

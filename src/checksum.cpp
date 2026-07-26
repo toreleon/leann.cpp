@@ -330,6 +330,33 @@ std::string hex_digest(const Sha256Digest & digest) {
     return result;
 }
 
+std::optional<Sha256Digest> parse_hex_digest(std::string_view text) {
+    if (text.size() != Sha256Digest{}.size() * 2U) {
+        return std::nullopt;
+    }
+    // Lowercase only. Accepting both cases would make two spellings of one
+    // digest compare unequal as manifest text while comparing equal as bytes.
+    const auto nibble = [](char character) -> int {
+        if (character >= '0' && character <= '9') {
+            return character - '0';
+        }
+        if (character >= 'a' && character <= 'f') {
+            return character - 'a' + 10;
+        }
+        return -1;
+    };
+    Sha256Digest digest{};
+    for (std::size_t i = 0; i < digest.size(); ++i) {
+        const int high = nibble(text[i * 2U]);
+        const int low = nibble(text[i * 2U + 1U]);
+        if (high < 0 || low < 0) {
+            return std::nullopt;
+        }
+        digest[i] = static_cast<std::uint8_t>((high << 4) | low);
+    }
+    return digest;
+}
+
 std::uint32_t crc32c(std::string_view bytes) {
     std::uint32_t checksum = 0xffffffffU;
     for (const unsigned char byte : bytes) {

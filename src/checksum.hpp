@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <istream>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -43,6 +44,11 @@ void append_sha256_footer(const std::filesystem::path & path);
 [[nodiscard]] std::uint64_t
 verify_sha256_footer(std::istream & input, std::string_view artifact_name);
 [[nodiscard]] std::string hex_digest(const Sha256Digest & digest);
+// Inverse of hex_digest. Accepts exactly 64 lowercase hex characters and
+// returns nullopt for anything else, so a manifest cannot smuggle a shorter or
+// differently spelled digest past a comparison.
+[[nodiscard]] std::optional<Sha256Digest>
+parse_hex_digest(std::string_view text);
 
 [[nodiscard]] std::uint32_t crc32c(std::string_view bytes);
 

@@ -23,10 +23,13 @@ void expect_failure(const std::function<void()> & action,
     } catch (const std::exception & error) {
         check(std::string_view(error.what()).find(expected_message) !=
                   std::string_view::npos,
-              "failure message");
+              "expected a failure containing '" +
+                  std::string(expected_message) + "', got '" + error.what() +
+                  "'");
         return;
     }
-    throw std::runtime_error("expected operation to fail");
+    throw std::runtime_error("expected operation to fail containing '" +
+                             std::string(expected_message) + "'");
 }
 
 void write_text(const std::filesystem::path & path, std::string_view text) {
@@ -1224,6 +1227,308 @@ void test_build_progress_reporting(const std::filesystem::path & directory) {
           "publication is the final reported phase");
 }
 
+// --card is the first repeatable option; the parser used to keep only the
+// last occurrence of any flag, which would have silently dropped card entries.
+void test_repeatable_card_option() {
+    const auto arguments = make_arguments(
+        {"leann", "build", "--card", "a=1", "--card", "b=2", "--index", "x"});
+    check(arguments.all("--card").size() == 2U,
+          "both --card occurrences are kept");
+    check(arguments.all("--card")[0] == "a=1" &&
+              arguments.all("--card")[1] == "b=2",
+          "repeated values keep command-line order");
+    check(arguments.get("--card") == "b=2",
+          "single-value accessors still see the last occurrence");
+    check(arguments.all("--missing").empty(),
+          "an absent repeatable option yields no values");
+
+    const auto card = parse_card_entries(arguments);
+    check(card.size() == 2U && card[0].first == "a" && card[0].second == "1" &&
+              card[1].first == "b",
+          "card entries parse in order");
+
+    expect_failure(
+        [&] {
+            (void)parse_card_entries(
+                make_arguments({"leann", "build", "--card", "novalue"}));
+        },
+        "must be KEY=VALUE");
+    expect_failure(
+        [&] {
+            (void)parse_card_entries(
+                make_arguments({"leann", "build", "--card", "=orphan"}));
+        },
+        "key must not be empty");
+    expect_failure(
+        [&] {
+            (void)parse_card_entries(
+                make_arguments({"leann", "build", "--card", "k=a\tb"}));
+        },
+        "control characters");
+    // A value containing '=' is legal: only the first '=' separates.
+    const auto equals = parse_card_entries(
+        make_arguments({"leann", "build", "--card", "cmd=a=b"}));
+    check(equals.size() == 1U && equals[0].second == "a=b",
+          "only the first equals sign separates a card entry");
+}
+
+// `pull` needs a positional argument, which every other command must still
+// reject — a stray token is otherwise indistinguishable from a missing value.
+void test_positional_arguments() {
+    const CommandSpec * const pull = find_command("pull");
+    const CommandSpec * const stats = find_command("stats");
+    check(pull != nullptr && stats != nullptr, "pull and stats are registered");
+
+    validate_arguments(*pull, make_arguments({"leann", "pull", "hf:o/r"}));
+    validate_arguments(*pull, make_arguments({"leann", "pull"}));
+    expect_failure(
+        [&] {
+            validate_arguments(
+                *pull, make_arguments({"leann", "pull", "hf:o/r", "extra"}));
+        },
+        "takes one hf:OWNER/NAME argument");
+    // The default rejection must stay byte-identical for every other command.
+    expect_failure(
+        [&] {
+            validate_arguments(*stats,
+                               make_arguments({"leann", "stats", "junk"}));
+        },
+        "unexpected argument for leann stats: junk");
+
+    check(parse_repo_spec("hf:owner/name").repo == "owner/name",
+          "a model repository parses");
+    check(parse_repo_spec("hf:datasets/owner/name").repo_type == "dataset",
+          "a dataset repository parses");
+    for (const std::string_view bad :
+         {"owner/name", "hf:owner", "hf:/name", "hf:owner/", "hf:a/b/c"}) {
+        expect_failure([&] { (void)parse_repo_spec(bad); }, "repository must");
+    }
+    // `pull` writes these values into a single-quoted shell argument that a
+    // person pastes into a terminal, so an apostrophe would end the quoting
+    // and the rest of the line would stop being data.
+    for (const std::string_view unsafe :
+         {"hf:owner/na'me", "hf:owner/na me", "hf:owner/na;me",
+          "hf:owner/na$me", "hf:owner/na\"me", "hf:owner/na`me"}) {
+        expect_failure([&] { (void)parse_repo_spec(unsafe); },
+                       "unsafe repository");
+    }
+    validate_manifest_token("owner/name-v1.5_x", "repository");
+    expect_failure(
+        [&] { validate_manifest_token("main;id", "--revision"); },
+        "unsafe --revision");
+}
+
+// The LEANNMF1 reader is the counterpart of the Python publisher's writer.
+// Both sides are strict: an unknown key or a malformed digest is an error, so
+// an older binary never half-understands a newer manifest.
+void test_manifest_parser(const std::filesystem::path & directory) {
+    const auto path = directory / "good.manifest";
+    const std::string good =
+        "LEANNMF1\n"
+        "repo\towner/name\n"
+        "type\tdataset\n"
+        "revision\tabc123\n"
+        "prefix\tcorpus\n"
+        "file\tcorpus.leann\t10\tsha256:" +
+        std::string(64, 'a') + "\n" + "file\tcorpus.docs\t20\tsha256:" +
+        std::string(64, 'b') + "\n" + "model\thf:o/r/m.gguf\t30\tsha256:" +
+        std::string(64, 'c') + "\n";
+    write_text(path, good);
+
+    const Manifest manifest = read_manifest(path);
+    check(manifest.repo == "owner/name" && manifest.repo_type == "dataset" &&
+              manifest.revision == "abc123" && manifest.prefix == "corpus",
+          "manifest header records parse");
+    check(manifest.files.size() == 2U && manifest.files[0].bytes == 10U,
+          "file records parse");
+    check(manifest.has_model && manifest.model.bytes == 30U &&
+              manifest.model_source == "hf:o/r/m.gguf",
+          "the model record parses");
+    check(resolve_url(manifest, "corpus.leann") ==
+              "https://huggingface.co/datasets/owner/name/resolve/abc123/"
+              "corpus.leann",
+          "a dataset resolve URL inserts /datasets");
+
+    const auto reject = [&](std::string_view text, std::string_view message) {
+        const auto bad = directory / "bad.manifest";
+        write_text(bad, text);
+        expect_failure([&] { (void)read_manifest(bad); }, message);
+    };
+    reject("", "not a LEANNMF1 manifest");
+    reject("LEANNMF2\n", "not a LEANNMF1 manifest");
+    // CR is rejected rather than stripped: the manifest is compared against
+    // digests, so silently rewriting the byte stream is the wrong default.
+    reject("LEANNMF1\r\nrepo\towner/name\n", "CRLF line endings");
+    reject("LEANNMF1\nrepo\towner/name\nprefix\tc\nfiles\tx\n",
+           "unknown manifest key");
+    reject("LEANNMF1\nrepo\towner/name\nrepo\tother/name\n",
+           "duplicate manifest key");
+    reject("LEANNMF1\nrepo\townername\nprefix\tc\n", "must be OWNER/NAME");
+    reject("LEANNMF1\nrepo\towner/name\nprefix\tc\n\n", "blank line");
+    reject("LEANNMF1\nrepo\towner/name\nprefix\tc\nfile\tc.leann\t10\n",
+           "record needs 3 fields");
+    reject("LEANNMF1\nrepo\towner/name\nprefix\tc\nfile\tc.leann\tten\tsha256:" +
+               std::string(64, 'a') + "\n",
+           "not a decimal count");
+    reject("LEANNMF1\nrepo\towner/name\nprefix\tc\nfile\tc.leann\t10\t" +
+               std::string(64, 'a') + "\n",
+           "must start with sha256:");
+    // Uppercase hex is refused so one digest has exactly one spelling.
+    reject("LEANNMF1\nrepo\towner/name\nprefix\tc\nfile\tc.leann\t10\tsha256:" +
+               std::string(64, 'A') + "\n",
+           "64 lowercase hex");
+    reject("LEANNMF1\nrepo\towner/name\nprefix\tc\nfile\t../escape\t10\t"
+           "sha256:" +
+               std::string(64, 'a') + "\n",
+           "unsafe manifest file name");
+    reject("LEANNMF1\nrepo\towner/name\nprefix\tc\nfile\t/abs\t10\tsha256:" +
+               std::string(64, 'a') + "\n",
+           "unsafe manifest file name");
+    // A manifest that lists only one half of the pair describes something
+    // that cannot be searched.
+    reject("LEANNMF1\nrepo\towner/name\nprefix\tcorpus\n"
+           "file\tcorpus.leann\t10\tsha256:" +
+               std::string(64, 'a') + "\n",
+           "does not list corpus.docs");
+    reject("LEANNMF1\nrepo\towner/name\nprefix\tc\ntype\tzip\n",
+           "type must be model or dataset");
+    // A manifest is an untrusted download, so the shell-safety allowlist has
+    // to hold on the read side too, not only where the publisher wrote it.
+    reject("LEANNMF1\nrepo\towner/na'me\nprefix\tc\n", "unsafe manifest repo");
+    // A dot segment is inert in a name but not in a URL path: this revision
+    // would redirect every printed download to a different repository.
+    reject("LEANNMF1\nrepo\towner/name\n"
+           "revision\t../../other/repo/resolve/main\nprefix\tc\n",
+           "must not contain '..'");
+    reject("LEANNMF1\nrepo\to/..\nprefix\tc\n", "must not contain '..'");
+    reject("LEANNMF1\nrepo\towner/name\nrevision\tmain;id\nprefix\tc\n",
+           "unsafe manifest revision");
+    reject("LEANNMF1\nrepo\towner/name\nprefix\tc\nfile\tc'.leann\t1\tsha256:" +
+               std::string(64, 'a') + "\n",
+           "unsafe manifest file name");
+    // A model origin is prose, never a command, and legitimately holds a
+    // colon, so it takes the weaker rule rather than the allowlist.
+    const auto colon = directory / "colon.manifest";
+    write_text(colon,
+               "LEANNMF1\nrepo\towner/name\nprefix\tc\n"
+               "file\tc.leann\t1\tsha256:" +
+                   std::string(64, 'a') + "\nfile\tc.docs\t1\tsha256:" +
+                   std::string(64, 'b') + "\nmodel\thf:o/r/m.gguf\t1\tsha256:" +
+                   std::string(64, 'c') + "\n");
+    check(read_manifest(colon).model_source == "hf:o/r/m.gguf",
+          "a model origin with a colon is accepted");
+}
+
+void test_pull_prints_a_plan_and_verify_gates(
+    const std::filesystem::path & directory) {
+    const auto prefix = directory / "pullable";
+    build_test_pair(prefix, {"alpha document", "beta document",
+                             "gamma document", "delta document"},
+                    32U);
+    const auto index_path = leann::index_file_from_prefix(prefix);
+    const auto documents_path = leann::documents_file_from_prefix(prefix);
+    const auto digest_of = [](const std::filesystem::path & path) {
+        return leann::detail::hex_digest(leann::detail::sha256_file_prefix(
+            path, std::filesystem::file_size(path)));
+    };
+    const auto manifest_path = directory / "pullable.manifest";
+    write_text(manifest_path,
+               "LEANNMF1\nrepo\towner/name\nprefix\tpullable\n"
+               "file\tpullable.leann\t" +
+                   std::to_string(std::filesystem::file_size(index_path)) +
+                   "\tsha256:" + digest_of(index_path) + "\n" +
+                   "file\tpullable.docs\t" +
+                   std::to_string(std::filesystem::file_size(documents_path)) +
+                   "\tsha256:" + digest_of(documents_path) + "\n");
+
+    // Without a manifest, pull prints the two-step plan and nothing else.
+    const auto [bare, bare_error] = capture_streams([&] {
+        command_pull(make_arguments({"leann", "pull", "hf:owner/name"}));
+    });
+    check(bare.find("curl -fL --retry 3 -o") != std::string::npos,
+          "pull prints a curl command");
+    check(bare.find("https://huggingface.co/owner/name/resolve/main/"
+                    "leann.manifest") != std::string::npos,
+          "pull prints the manifest URL");
+    check(bare_error.empty(), "pull writes nothing to stderr");
+
+    const auto [planned, planned_error] = capture_streams([&] {
+        command_pull(make_arguments({"leann", "pull", "hf:owner/name",
+                                     "--manifest", manifest_path.string()}));
+    });
+    check(planned.find("pullable.leann") != std::string::npos &&
+              planned.find("pullable.docs") != std::string::npos,
+          "the checked plan names both artifacts");
+    check(planned.find("leann verify --index") != std::string::npos,
+          "the plan ends with the verify command");
+    (void)planned_error;
+
+    // verify is a gate, not a report: it must throw so main exits nonzero.
+    const auto [verified, verified_error] = capture_streams([&] {
+        command_verify(make_arguments({"leann", "verify", "--index",
+                                       prefix.string(), "--manifest",
+                                       manifest_path.string()}));
+    });
+    check(verified.find("pair: valid") != std::string::npos,
+          "verify reuses doctor's pair vocabulary");
+    check(verified.find("verify: ok") != std::string::npos,
+          "a matching pair verifies");
+    (void)verified_error;
+
+    // A manifest describing a different prefix must fail closed rather than
+    // report a mismatch that reads like corruption.
+    const auto other_manifest = directory / "other.manifest";
+    write_text(other_manifest,
+               "LEANNMF1\nrepo\towner/name\nprefix\telsewhere\n"
+               "file\telsewhere.leann\t1\tsha256:" +
+                   std::string(64, 'a') + "\n" +
+                   "file\telsewhere.docs\t1\tsha256:" + std::string(64, 'b') +
+                   "\n");
+    expect_failure(
+        [&] {
+            (void)capture_streams([&] {
+                command_verify(make_arguments({"leann", "verify", "--index",
+                                               prefix.string(), "--manifest",
+                                               other_manifest.string()}));
+            });
+        },
+        "but --index names");
+
+    // Tamper with the last byte, which is document payload rather than the
+    // metadata the store checksums at open. The pair still loads, so the
+    // manifest digest is the only thing that can catch this — which is
+    // exactly the job verify exists to do.
+    {
+        std::fstream file(documents_path,
+                          std::ios::binary | std::ios::in | std::ios::out);
+        file.seekp(static_cast<std::streamoff>(
+            std::filesystem::file_size(documents_path) - 1U));
+        file.put('!');
+    }
+    {
+        const auto [tampered, tampered_error] = capture_streams([&] {
+            try {
+                command_verify(make_arguments({"leann", "verify", "--index",
+                                               prefix.string()}));
+            } catch (const std::exception &) {
+                // Without a manifest there is nothing to compare against.
+            }
+        });
+        check(tampered.find("pair: valid") != std::string::npos,
+              "a payload edit still loads, so only the digest can catch it");
+        (void)tampered_error;
+    }
+    expect_failure(
+        [&] {
+            (void)capture_streams([&] {
+                command_verify(make_arguments({"leann", "verify", "--index",
+                                               prefix.string(), "--manifest",
+                                               manifest_path.string()}));
+            });
+        },
+        "does not match the files on disk");
+}
+
 } // namespace
 
 int main() {
@@ -1250,6 +1555,10 @@ int main() {
         test_doctor_reports_lock_ownership(directory);
         test_build_cancellation(directory);
         test_build_progress_reporting(directory);
+        test_repeatable_card_option();
+        test_positional_arguments();
+        test_manifest_parser(directory);
+        test_pull_prints_a_plan_and_verify_gates(directory);
         std::filesystem::remove_all(directory);
         std::cout << "all CLI cache tests passed\n";
         return 0;

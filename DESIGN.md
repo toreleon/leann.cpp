@@ -71,7 +71,7 @@ when loaded.
 
 | Field | Type |
 |---|---|
-| magic | 8 bytes, `LEANNC03` |
+| magic | 8 bytes, `LEANNC04` |
 | version, metric | `u32`, `u32` |
 | corpus pair identity | 32-byte SHA-256 |
 | dimension, approximation kind | `u32`, `u32` |
@@ -82,6 +82,14 @@ when loaded.
 | node count, base edge count | `u64`, `u64` |
 | PQ codebook value count, approximation code bytes | `u64`, `u64` |
 | fingerprint size + bytes | `u32` + UTF-8 |
+| model source size + bytes | `u32` + UTF-8 |
+| model digest | 32-byte SHA-256, all zero when absent |
+| model size | `u64`, file bytes, 0 when absent |
+| pooling type, context tokens | `u32`, `u32` |
+| document prefix size + bytes | `u32` + UTF-8 |
+| query prefix size + bytes | `u32` + UTF-8 |
+| artifact card entry count | `u32` |
+| each card entry | key `u32` + UTF-8, value `u32` + UTF-8 |
 | base CSR offsets, edges | `(N + 1) * u64`, `E * u32` |
 | each upper-layer counts | node count + edge count, `u64` × 2 |
 | each upper-layer CSR | node IDs `u32`, offsets `u64`, edges `u32` |
@@ -91,6 +99,86 @@ when loaded.
 
 The format currently uses 64-bit CSR offsets to avoid a 4-billion-edge limit.
 An optional blocked/varint CSR format is a future storage optimization.
+
+### Embedder descriptor and artifact card
+
+The descriptor section exists so an index is a self-describing artifact rather
+than something that only works on the machine that built it. The fingerprint
+answers "is this the right embedder?" after the fact; the descriptor answers
+"which embedder do I need?" beforehand, which is the question somebody who
+just downloaded the pair actually has.
+
+`model source` is an origin string the publisher supplies (`hf:OWNER/REPO/FILE`
+by convention). It is an unverified claim. `model digest` is not: it is the
+SHA-256 of the model file as read at build time, so a fetched copy can be
+checked against it. Neither is a trust root — a matching digest establishes
+that the bytes are the ones the publisher recorded, not that the publisher is
+trustworthy. `model size` is the **file** size, deliberately different from the
+`llama_model_size()` tensor total already inside the fingerprint string.
+
+Every string in the section is validated identically on write and on read:
+length-capped, no C0 control characters or DEL, valid UTF-8, and card keys
+unique. The read-side copy is not redundant. These values are reproduced in
+three delimiter-sensitive places — the `key=value` lines of `stats`, the
+tab-separated `LEANNMF1` manifest, and a shell command printed by `pull` — so
+a newline forges a record rather than corrupting one, and invalid UTF-8 would
+make `stats --format json` fail permanently on an otherwise valid index.
+
+The card preserves the order it was given and rejects duplicate keys. Flag
+order is therefore part of the artifact bytes: the same logical card supplied
+in a different order is a different file with a different SHA-256. Nothing
+time- or host-derived is ever written, so two builds of the same corpus with
+the same options and the same backend produce identical bytes.
+
+### Document and query prefixes
+
+Instruction-prefixed embedding models (`search_document: ` / `search_query: `
+for nomic-embed) only work if the prefix used at query time matches the one
+used at build time. The prefixes are therefore index state, applied by `Index`
+at all three embedding sites: the build pass, the query in `Index::search`, and
+the rerank recomputation in `search_embedding`.
+
+They are deliberately **not** part of the embedder fingerprint. A live embedder
+cannot know an index's prefixes without first loading that index, so folding
+them in would be circular. More decisively, `Index` hands the same `Embedder &`
+both queries and documents with no distinguishing signal, so neither a
+fingerprint nor a wrapping decorator could tell which prefix to apply.
+
+The prefix never reaches the document store. Pair identity is derived from the
+raw chunk bytes, and a search result must be the chunk, not the chunk with a
+prompt glued to the front of it.
+
+A caller that embeds its own query and calls `search_embedding` directly must
+apply `query_prefix()` itself; `leann bench` does exactly this. Precomputed
+embeddings cannot be reconciled with a prefix at all — a `LEANNBC2` cache
+records no prefix and its vectors already exist — so those combinations are
+rejected rather than silently accepted at degraded recall.
+
+### Migration from `LEANNC03`
+
+A v3 index is recognised by magic and rejected with a message naming the
+boundary, rather than reported as "not a leann.cpp index". There is no in-place
+upgrade: the descriptor and the prefixes are load-bearing for search, so a v3
+pair has to be rebuilt from its source chunks.
+
+### `LEANNMF1` manifests
+
+A published index needs its digests to travel separately from the files they
+describe, because a corrupted download cannot be trusted to report its own
+corruption. `leann pull` reads a manifest and prints the exact commands that
+fetch the artifacts; `leann verify` checks what landed against it.
+
+The manifest is line-oriented and tab-separated rather than JSON, because the
+repository takes no JSON parser dependency and because a small grammar is one
+that can be rejected precisely. Parsing is fail-closed with no lenient mode: an
+unknown key, a duplicate record, a CRLF line ending, an uppercase digest, a
+name containing `..`, or a `prefix` whose `.leann` and `.docs` are not both
+listed are all errors. A newer manifest is never half-understood by an older
+binary.
+
+`pull` opens no socket. That is the whole reason the binary needs no HTTP
+client, no TLS surface, and no new dependency — and also the reason `pull`
+alone verifies nothing.
 
 ### `.docs`
 
@@ -180,6 +268,11 @@ worst-case latency is one such pass.
 - Configuration ratios, embeddings, PQ intermediates, and exact distances are
   finite before conversion, heap insertion, or sorting.
 - Build and search embedder fingerprints must match.
+- Document and query prefixes are index state, applied by `Index`, and are
+  never part of the fingerprint, the document store, or the corpus identity.
+- Descriptor strings are length-capped, free of control characters, and valid
+  UTF-8, checked identically on write and on read; card keys are unique.
+- Nothing time- or host-derived is written into an artifact.
 - Every CSR edge points to an existing node.
 - Every upper edge points to a node present on that layer, and the global
   entry point occurs on every retained upper layer.
@@ -201,9 +294,20 @@ worst-case latency is one such pass.
   Vulkan or the exact llama.cpp build flags.
 - Build memory is still `O(N * dimension)`.
 - A model description/size/config fingerprint is a guardrail, not a
-  cryptographic model or backend hash.
+  cryptographic model or backend hash. The descriptor's `model digest` does
+  identify the GGUF file, but it is recorded metadata rather than something
+  the loader enforces: nothing checks that the model in use hashes to it.
+- `context tokens` is recorded but not enforced against the live embedder, so
+  a search with a different `--ctx` than the build is still accepted.
 - CRC32C detects accidental chunk corruption but is not an authenticity
   mechanism.
+- A `LEANNMF1` manifest is unsigned and has no trust root or revocation. A
+  matching digest proves the bytes are the ones the publisher recorded, and
+  nothing more.
+- A recorded artifact digest pins one specific build. Embeddings are not
+  bit-identical across backends or batch shapes, so the same corpus rebuilt
+  elsewhere, or with a different `--batch-tokens` or `--parallel`, is a valid
+  index with different bytes.
 - Stale-lock/backup recovery after an unclean machine stop is currently
   manual.
 - Concurrent searches may share `Index` and `DocumentStore`; concurrency of a

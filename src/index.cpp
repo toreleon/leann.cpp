@@ -5,6 +5,7 @@
 #include "checksum.hpp"
 #include "format.hpp"
 #include "product_quantizer.hpp"
+#include "text.hpp"
 
 #include <hnswlib/hnswlib.h>
 
@@ -28,11 +29,77 @@ namespace leann {
 namespace {
 
 constexpr std::array<char, 8> index_magic{'L', 'E', 'A', 'N',
-                                           'N', 'C', '0', '3'};
-constexpr std::uint32_t index_version = 3;
+                                           'N', 'C', '0', '4'};
+constexpr std::uint32_t index_version = 4;
 constexpr std::uint32_t cosine_metric = 1;
 
+// Recognized only to name the migration boundary. A v3 index predates the
+// embedder descriptor and the document/query prefixes, and both are load-
+// bearing for search, so there is no in-place upgrade: the pair has to be
+// rebuilt from its source chunks.
+constexpr std::array<char, 8> index_magic_v3{'L', 'E', 'A', 'N',
+                                             'N', 'C', '0', '3'};
+
 using Clock = std::chrono::steady_clock;
+
+// Every descriptor string is reproduced verbatim in line-oriented and
+// tab-separated output, so a control character in one forges a record instead
+// of corrupting it, and invalid UTF-8 would make `stats --format json` fail
+// permanently on an otherwise valid index.
+void validate_descriptor_text(std::string_view value, const char * field) {
+    if (detail::has_control_characters(value)) {
+        throw std::runtime_error(std::string(field) +
+                                 " must not contain control characters");
+    }
+    if (!detail::is_valid_utf8(value)) {
+        throw std::runtime_error(std::string(field) +
+                                 " must be valid UTF-8");
+    }
+}
+
+// Rejects a descriptor before the index file is opened, so an over-long field
+// can never produce a partially written artifact. Index::load applies exactly
+// these rules to what it reads, so a hostile file cannot smuggle in a value a
+// build would have refused.
+void validate_descriptor(const EmbedderDescriptor & model,
+                         const std::string & document_prefix,
+                         const std::string & query_prefix,
+                         const ArtifactCard & card) {
+    if (model.source.size() > max_model_source_bytes) {
+        throw std::runtime_error("model source is too long");
+    }
+    validate_descriptor_text(model.source, "model source");
+    if (document_prefix.size() > max_prefix_bytes) {
+        throw std::runtime_error("document prefix is too long");
+    }
+    validate_descriptor_text(document_prefix, "document prefix");
+    if (query_prefix.size() > max_prefix_bytes) {
+        throw std::runtime_error("query prefix is too long");
+    }
+    validate_descriptor_text(query_prefix, "query prefix");
+    if (card.size() > max_card_entries) {
+        throw std::runtime_error("artifact card has too many entries");
+    }
+    std::unordered_set<std::string> keys;
+    for (const auto & [key, value] : card) {
+        if (key.empty()) {
+            throw std::runtime_error("artifact card key must not be empty");
+        }
+        if (key.size() > max_card_key_bytes) {
+            throw std::runtime_error("artifact card key is too long: " + key);
+        }
+        if (value.size() > max_card_value_bytes) {
+            throw std::runtime_error("artifact card value is too long: " + key);
+        }
+        validate_descriptor_text(key, "artifact card key");
+        validate_descriptor_text(value, "artifact card value");
+        // Duplicate keys would make the card ambiguous to every reader and
+        // would let two different inputs claim the same meaning.
+        if (!keys.insert(key).second) {
+            throw std::runtime_error("duplicate artifact card key: " + key);
+        }
+    }
+}
 
 std::uint64_t splitmix64(std::uint64_t value) {
     value += 0x9e3779b97f4a7c15ULL;
@@ -153,6 +220,14 @@ void write_vector(std::ostream & output, std::span<const T> values) {
     for (const T value : values) {
         detail::write_le<T>(output, value);
     }
+}
+
+// Length-prefixed UTF-8, the same shape the embedder fingerprint already uses.
+// Callers validate the length cap before reaching here.
+void write_string(std::ostream & output, const std::string & value) {
+    detail::write_le<std::uint32_t>(output,
+                                    static_cast<std::uint32_t>(value.size()));
+    detail::write_bytes(output, value.data(), value.size());
 }
 
 template <typename T>
@@ -395,6 +470,18 @@ void Index::build(const std::filesystem::path & index_path,
     if (documents.empty()) {
         throw std::invalid_argument("cannot build an empty index");
     }
+    // Resolved and validated up front, before the corpus is written or a
+    // single vector is computed. Doing it at write time would mean a typo in
+    // a card entry is reported only after the whole embedding pass, and on a
+    // large corpus with a GGUF embedder that is hours of wasted work. It also
+    // fails fast on an unreadable model file, since describing a llama
+    // embedder digests its GGUF.
+    EmbedderDescriptor model = embedder.descriptor();
+    if (!config.model_source.empty()) {
+        model.source = config.model_source;
+    }
+    validate_descriptor(model, config.document_prefix, config.query_prefix,
+                        config.card);
     if (documents.size() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("this index format supports at most 2^32-1 nodes");
     }
@@ -447,12 +534,26 @@ void Index::build(const std::filesystem::path & index_path,
     observer.begin("embedding", documents.size());
     std::vector<Embedding> embeddings;
     embeddings.reserve(documents.size());
+    // The prefix is applied here rather than to the corpus file, so the
+    // document store keeps the raw chunk bytes: it must not reach the stored
+    // text, the corpus identity, or a search result.
+    std::vector<std::string> prefixed;
     for (std::size_t begin = 0; begin < documents.size();
          begin += config.embedding_batch_size) {
         observer.checkpoint();
         const std::size_t end =
             std::min(documents.size(), begin + config.embedding_batch_size);
-        auto batch = embedder.embed(documents.subspan(begin, end - begin));
+        const auto raw = documents.subspan(begin, end - begin);
+        std::span<const std::string> to_embed = raw;
+        if (!config.document_prefix.empty()) {
+            prefixed.clear();
+            prefixed.reserve(raw.size());
+            for (const std::string & document : raw) {
+                prefixed.push_back(config.document_prefix + document);
+            }
+            to_embed = prefixed;
+        }
+        auto batch = embedder.embed(to_embed);
         if (batch.size() != end - begin) {
             throw std::runtime_error("embedder returned the wrong batch size");
         }
@@ -658,10 +759,9 @@ void Index::build(const std::filesystem::path & index_path,
     const std::uint32_t entry_point = static_cast<std::uint32_t>(
         hnsw.getExternalLabel(hnsw.enterpoint_node_));
     const std::string fingerprint = embedder.fingerprint();
-    if (fingerprint.size() > std::numeric_limits<std::uint32_t>::max()) {
+    if (fingerprint.size() > max_fingerprint_bytes) {
         throw std::runtime_error("embedder fingerprint is too long");
     }
-
     observer.begin("writing index", 0);
     observer.checkpoint();
     std::ofstream output(temporary_index_path,
@@ -702,6 +802,24 @@ void Index::build(const std::filesystem::path & index_path,
     detail::write_le<std::uint32_t>(
         output, static_cast<std::uint32_t>(fingerprint.size()));
     detail::write_bytes(output, fingerprint.data(), fingerprint.size());
+    // Embedder descriptor and artifact card. Everything here is caller- or
+    // embedder-derived; nothing is time- or host-derived, so two builds of the
+    // same corpus with the same options produce the same bytes.
+    write_string(output, model.source);
+    detail::write_bytes(output,
+                        reinterpret_cast<const char *>(model.sha256.data()),
+                        model.sha256.size());
+    detail::write_le<std::uint64_t>(output, model.bytes);
+    detail::write_le<std::uint32_t>(output, model.pooling_type);
+    detail::write_le<std::uint32_t>(output, model.context_tokens);
+    write_string(output, config.document_prefix);
+    write_string(output, config.query_prefix);
+    detail::write_le<std::uint32_t>(
+        output, static_cast<std::uint32_t>(config.card.size()));
+    for (const auto & [key, value] : config.card) {
+        write_string(output, key);
+        write_string(output, value);
+    }
     write_vector<std::uint64_t>(output, offsets);
     write_vector<std::uint32_t>(output, edges);
     for (const SerializedUpperLayer & layer : upper_layers) {
@@ -755,6 +873,17 @@ Index Index::load(const std::filesystem::path & index_path) {
 
     std::array<char, index_magic.size()> magic{};
     detail::read_bytes(input, magic.data(), magic.size());
+    if (magic == index_magic_v3) {
+        // Named explicitly rather than reported as "not a leann.cpp index",
+        // which is what a bare magic mismatch would say about an artifact this
+        // binary's predecessor wrote.
+        throw std::runtime_error(
+            "index is in the LEANNC03 format, which predates the embedder "
+            "descriptor and the document/query prefixes: rebuild the pair "
+            "from its source chunks with this binary; there is no in-place "
+            "upgrade: " +
+            index_path.string());
+    }
     if (magic != index_magic) {
         throw std::runtime_error("not a leann.cpp index: " + index_path.string());
     }
@@ -846,10 +975,80 @@ Index Index::load(const std::filesystem::path & index_path) {
     const std::size_t code_bytes =
         detail::checked_size(code_bytes_on_disk, "approximation codes");
 
+    if (fingerprint_size > max_fingerprint_bytes) {
+        throw std::runtime_error("embedder fingerprint is too long");
+    }
     consume(fingerprint_size, 1, "embedder fingerprint");
     index.embedder_fingerprint_.resize(fingerprint_size_in_memory);
     detail::read_bytes(input, index.embedder_fingerprint_.data(),
                        fingerprint_size_in_memory);
+    // Held to the same rule as the descriptor strings beside it: the
+    // fingerprint is printed by `stats` on its own `key=value` line and
+    // emitted as JSON, so a newline in it would forge a line and invalid
+    // UTF-8 would make `--format json` fail on an otherwise valid index.
+    validate_descriptor_text(index.embedder_fingerprint_,
+                             "embedder fingerprint");
+
+    // Embedder descriptor and artifact card. Each field is bounded twice: by
+    // `consume` against the bytes the file actually has, and by an absolute
+    // cap. The budget alone is not enough — a multi-gigabyte index leaves
+    // enough of it to honour a hostile length field.
+    const auto read_capped_string = [&](std::size_t cap, const char * field) {
+        consume(1, sizeof(std::uint32_t), field);
+        const std::uint64_t size = detail::read_le<std::uint32_t>(input);
+        if (size > cap) {
+            throw std::runtime_error(std::string(field) + " is too long");
+        }
+        consume(size, 1, field);
+        std::string value(detail::checked_size(size, field), '\0');
+        detail::read_bytes(input, value.data(), value.size());
+        // Applied on read as well as on write: a file this binary did not
+        // produce must not be able to introduce bytes a build would refuse.
+        validate_descriptor_text(value, field);
+        return value;
+    };
+
+    index.model_.source =
+        read_capped_string(max_model_source_bytes, "model source");
+    consume(index.model_.sha256.size(), 1, "model digest");
+    detail::read_bytes(input,
+                       reinterpret_cast<char *>(index.model_.sha256.data()),
+                       index.model_.sha256.size());
+    consume(1, sizeof(std::uint64_t), "model size");
+    index.model_.bytes = detail::read_le<std::uint64_t>(input);
+    consume(2, sizeof(std::uint32_t), "model pooling and context");
+    index.model_.pooling_type = detail::read_le<std::uint32_t>(input);
+    index.model_.context_tokens = detail::read_le<std::uint32_t>(input);
+    index.document_prefix_ =
+        read_capped_string(max_prefix_bytes, "document prefix");
+    index.query_prefix_ = read_capped_string(max_prefix_bytes, "query prefix");
+
+    consume(1, sizeof(std::uint32_t), "artifact card count");
+    const std::uint32_t card_entries = detail::read_le<std::uint32_t>(input);
+    if (card_entries > max_card_entries) {
+        throw std::runtime_error("artifact card has too many entries");
+    }
+    // Reserved only after both the absolute cap and a check that the declared
+    // pairs could even fit in the bytes that remain, so a declared count never
+    // drives the allocation on its own.
+    if (card_entries > remaining / (2U * sizeof(std::uint32_t))) {
+        throw std::runtime_error("artifact card exceeds index file size");
+    }
+    index.card_.reserve(card_entries);
+    std::unordered_set<std::string> card_keys;
+    for (std::uint32_t entry = 0; entry < card_entries; ++entry) {
+        std::string key =
+            read_capped_string(max_card_key_bytes, "artifact card key");
+        std::string value =
+            read_capped_string(max_card_value_bytes, "artifact card value");
+        if (key.empty()) {
+            throw std::runtime_error("artifact card key must not be empty");
+        }
+        if (!card_keys.insert(key).second) {
+            throw std::runtime_error("duplicate artifact card key: " + key);
+        }
+        index.card_.emplace_back(std::move(key), std::move(value));
+    }
 
     consume(count_on_disk + 1U, sizeof(std::uint64_t), "CSR offsets");
     index.offsets_ = read_vector<std::uint64_t>(input, count + 1);
@@ -1011,8 +1210,12 @@ SearchResponse Index::search(std::string_view query,
     if (embedder.dimension() != dimension_) {
         throw std::invalid_argument("query embedding dimension mismatch");
     }
-    std::string owned_query(query);
-    const std::array<std::string, 1> queries{std::move(owned_query)};
+    // The index carries the prefix it was built with, so a downloaded artifact
+    // is queried the way its publisher queried it without the caller having to
+    // know. search_embedding cannot do this — it receives a finished vector —
+    // so a caller that embeds its own query must prepend query_prefix() itself.
+    const std::array<std::string, 1> queries{query_prefix_ +
+                                             std::string(query)};
     auto query_embeddings = embedder.embed(queries);
     if (query_embeddings.size() != 1) {
         throw std::runtime_error("embedder returned the wrong query batch size");
@@ -1226,6 +1429,14 @@ Index::search_embedding(std::span<const float> query_embedding,
             return;
         }
         auto texts = documents.read_many(ids);
+        // Rerank must recompute in the same space the build embedded in, or
+        // the exact cosine distances below rank against a different model of
+        // the corpus than the one the graph was built from.
+        if (!document_prefix_.empty()) {
+            for (std::string & text : texts) {
+                text.insert(0, document_prefix_);
+            }
+        }
         auto embeddings = embedder.embed(texts);
         if (embeddings.size() != ids.size()) {
             throw std::runtime_error("embedder returned the wrong batch size");
@@ -1294,6 +1505,14 @@ IndexStats Index::stats() const {
         static_cast<std::uint64_t>(size()) * dimension_ * sizeof(float);
     result.pair_identity = detail::hex_digest(pair_identity_);
     result.embedder_fingerprint = embedder_fingerprint_;
+    result.model_source = model_.source;
+    result.model_sha256 = detail::hex_digest(model_.sha256);
+    result.model_bytes = model_.bytes;
+    result.pooling_type = model_.pooling_type;
+    result.context_tokens = model_.context_tokens;
+    result.document_prefix = document_prefix_;
+    result.query_prefix = query_prefix_;
+    result.card = card_;
     return result;
 }
 
@@ -1307,6 +1526,22 @@ const std::string & Index::embedder_fingerprint() const noexcept {
 
 const PairIdentity & Index::pair_identity() const noexcept {
     return pair_identity_;
+}
+
+const std::string & Index::document_prefix() const noexcept {
+    return document_prefix_;
+}
+
+const std::string & Index::query_prefix() const noexcept {
+    return query_prefix_;
+}
+
+const EmbedderDescriptor & Index::model() const noexcept {
+    return model_;
+}
+
+const ArtifactCard & Index::card() const noexcept {
+    return card_;
 }
 
 void Index::validate_document_store(const DocumentStore & documents) const {

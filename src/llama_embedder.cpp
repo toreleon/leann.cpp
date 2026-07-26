@@ -1,11 +1,14 @@
 #include "leann/embedder.hpp"
 
+#include "checksum.hpp"
+
 #include <llama.h>
 
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -147,7 +150,11 @@ class LlamaEmbedder::Impl {
             throw std::runtime_error(
                 "failed to create llama.cpp embedding context");
         }
-        if (llama_pooling_type(context.get()) == LLAMA_POOLING_TYPE_NONE) {
+        // UNSPECIFIED is negative and would become a nonsense value in the
+        // index's unsigned pooling field, so it is rejected here alongside
+        // NONE rather than being recorded as 4294967295.
+        if (llama_pooling_type(context.get()) == LLAMA_POOLING_TYPE_NONE ||
+            llama_pooling_type(context.get()) < 0) {
             throw std::runtime_error(
                 "GGUF model has no sequence pooling; use an embedding model "
                 "with mean, CLS, or last-token pooling metadata");
@@ -261,11 +268,36 @@ class LlamaEmbedder::Impl {
         return output;
     }
 
+    // Digesting the GGUF is deferred to the first call because only a build
+    // needs it. A search loads the same model and must not pay to hash it.
+    EmbedderDescriptor describe() {
+        std::lock_guard lock(mutex);
+        if (!descriptor_value.source.empty()) {
+            return descriptor_value;
+        }
+        EmbedderDescriptor result;
+        result.source = config.model_source.empty() ? config.model_path
+                                                    : config.model_source;
+        result.pooling_type = static_cast<std::uint32_t>(
+            llama_pooling_type(context.get()));
+        result.context_tokens = config.context_tokens;
+        // The file size, deliberately: llama_model_size() reports the total
+        // tensor bytes, which is a smaller and different number, and it is a
+        // fetched file that a consumer has to check a digest against.
+        const std::filesystem::path model_file(config.model_path);
+        result.bytes =
+            static_cast<std::uint64_t>(std::filesystem::file_size(model_file));
+        result.sha256 = detail::sha256_file_prefix(model_file, result.bytes);
+        descriptor_value = result;
+        return result;
+    }
+
     Config config;
     std::unique_ptr<llama_model, ModelDeleter> model;
     std::unique_ptr<llama_context, ContextDeleter> context;
     std::size_t dimension = 0;
     std::string fingerprint_value;
+    EmbedderDescriptor descriptor_value;
     std::mutex mutex;
 };
 
@@ -282,6 +314,10 @@ std::size_t LlamaEmbedder::dimension() const noexcept {
 
 std::string LlamaEmbedder::fingerprint() const {
     return impl_->fingerprint_value;
+}
+
+EmbedderDescriptor LlamaEmbedder::descriptor() const {
+    return impl_->describe();
 }
 
 std::vector<Embedding>
