@@ -18,6 +18,7 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -70,6 +71,101 @@ constexpr std::array<std::string_view, 3> boolean_flag_names{
 [[nodiscard]] bool is_boolean_flag(std::string_view key) {
     return std::find(boolean_flag_names.begin(), boolean_flag_names.end(),
                      key) != boolean_flag_names.end();
+}
+
+// std::from_chars' floating-point overload is unavailable on Apple platforms
+// whose deployment target is below macOS 26 and needs GCC 11 under libstdc++,
+// so routing the CLI's decimal options through it made the whole program
+// unbuildable on ordinary toolchains. This scanner accepts exactly the
+// grammar std::chars_format::general accepted -- an optional '-', decimal
+// digits with an optional '.', and an optional 'e'/'E' exponent -- and so
+// still rejects the wider strtod spellings: a leading '+', leading or
+// trailing whitespace, hex floats, "inf", and "nan". Only the scanned digits
+// reach std::strtod, with the decimal point folded into the exponent, so
+// LC_NUMERIC cannot change how they are read while the platform's correctly
+// rounded conversion still produces the value.
+[[nodiscard]] constexpr bool is_ascii_digit(char character) noexcept {
+    return character >= '0' && character <= '9';
+}
+
+// Any exponent this large is out of double's range in both directions, so
+// saturating cannot change whether a value is accepted.
+constexpr long long decimal_exponent_limit = 1000000;
+
+[[nodiscard]] std::optional<double>
+parse_finite_decimal(std::string_view text) {
+    std::string normalized;
+    normalized.reserve(text.size() + 16);
+    bool has_digits = false;
+    bool has_nonzero_digit = false;
+    auto append_digit = [&](char digit) {
+        has_digits = true;
+        has_nonzero_digit = has_nonzero_digit || digit != '0';
+        normalized.push_back(digit);
+    };
+
+    std::size_t position = 0;
+    if (position < text.size() && text[position] == '-') {
+        normalized.push_back('-');
+        ++position;
+    }
+    while (position < text.size() && is_ascii_digit(text[position])) {
+        append_digit(text[position++]);
+    }
+    long long fraction_digits = 0;
+    if (position < text.size() && text[position] == '.') {
+        ++position;
+        while (position < text.size() && is_ascii_digit(text[position])) {
+            append_digit(text[position++]);
+            ++fraction_digits;
+        }
+    }
+    if (!has_digits) {
+        return std::nullopt;
+    }
+
+    long long exponent = 0;
+    if (position < text.size() &&
+        (text[position] == 'e' || text[position] == 'E')) {
+        std::size_t scan = position + 1;
+        const bool negative = scan < text.size() && text[scan] == '-';
+        if (scan < text.size() && (text[scan] == '+' || text[scan] == '-')) {
+            ++scan;
+        }
+        const std::size_t exponent_begin = scan;
+        long long magnitude = 0;
+        while (scan < text.size() && is_ascii_digit(text[scan])) {
+            if (magnitude < decimal_exponent_limit) {
+                magnitude = magnitude * 10 + (text[scan] - '0');
+            }
+            ++scan;
+        }
+        // A trailing 'e' with no digits is not part of the number, exactly as
+        // std::from_chars stopped before it; leaving `position` in front of
+        // the 'e' turns the remainder into the trailing text rejected below.
+        if (scan > exponent_begin) {
+            magnitude = std::min(magnitude, decimal_exponent_limit);
+            exponent = negative ? -magnitude : magnitude;
+            position = scan;
+        }
+    }
+    if (position != text.size()) {
+        return std::nullopt;
+    }
+
+    normalized.push_back('e');
+    normalized.append(std::to_string(exponent - fraction_digits));
+
+    char * conversion_end = nullptr;
+    const double parsed = std::strtod(normalized.c_str(), &conversion_end);
+    // Overflow to infinity and underflow to zero were both
+    // result_out_of_range under std::from_chars, and infinity and NaN were
+    // caught by the std::isfinite guard; all three stay rejected.
+    if (conversion_end != normalized.c_str() + normalized.size() ||
+        !std::isfinite(parsed) || (parsed == 0.0 && has_nonzero_digit)) {
+        return std::nullopt;
+    }
+    return parsed;
 }
 
 class Arguments {
@@ -171,17 +267,12 @@ class Arguments {
         if (value.empty()) {
             return fallback;
         }
-        double parsed = 0.0;
-        const auto [end, error] = std::from_chars(
-            value.data(), value.data() + value.size(), parsed,
-            std::chars_format::general);
-        if (error != std::errc{} ||
-            end != value.data() + value.size() ||
-            !std::isfinite(parsed)) {
+        const std::optional<double> parsed = parse_finite_decimal(value);
+        if (!parsed) {
             throw std::invalid_argument(
                 std::string(key) + " must be a finite number");
         }
-        return parsed;
+        return *parsed;
     }
 
     [[nodiscard]] bool bool_value(std::string_view key, bool fallback) const {

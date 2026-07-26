@@ -3,6 +3,7 @@
 #undef main
 
 #include <chrono>
+#include <cstring>
 #include <functional>
 #include <iterator>
 #include <set>
@@ -700,13 +701,54 @@ void test_strict_cli_numeric_parsing() {
 
     for (const std::string & invalid :
          {"0.5junk", "nan", "NaN", "inf", "-inf", "1e9999",
-          " 0.5", "0.5 "}) {
+          " 0.5", "0.5 ", "+0.5", "0x1p3", "INF", "infinity", ".",
+          "1e", "1e+", "-", "1.2.3", "e5", "1e-9999", "1e309",
+          "1e99999999999999999999"}) {
         const auto arguments = make_arguments(
             {"leann", "bench", "--ratio", invalid});
         expect_failure(
             [&] { (void)arguments.double_value("--ratio", 0.0); },
             "must be a finite number");
     }
+
+    // Spellings std::from_chars accepted must keep parsing to the same bits
+    // now that the conversion no longer goes through it. Compared with
+    // memcmp rather than ==, so the sign of -0 is pinned too.
+    const std::vector<std::pair<std::string, double>> accepted{
+        {"1.", 1.0},
+        {".5", 0.5},
+        {"-.5", -0.5},
+        {"1e3", 1000.0},
+        {"1E3", 1000.0},
+        {"1e+3", 1000.0},
+        {"1e-3", 0.001},
+        {"5.E-2", 0.05},
+        {"0.1", 0.1},
+        {"-0", -0.0},
+        {"0e99999", 0.0},
+        {"1e308", 1e308},
+        {"00000000000000000000001", 1.0},
+    };
+    for (const auto & [text, expected] : accepted) {
+        const auto arguments = make_arguments(
+            {"leann", "bench", "--ratio", text});
+        const double parsed = arguments.double_value("--ratio", 0.0);
+        check(std::memcmp(&parsed, &expected, sizeof(double)) == 0,
+              "accepted decimal spelling parses to the same bits");
+    }
+
+    // A tiny-but-positive rerank ratio must reach the library, which
+    // saturates the beam at index size; rejecting subnormals here would
+    // silently change that behaviour.
+    const auto subnormal = make_arguments({
+        "leann", "bench", "--ratio", "4.9406564584124654e-324"});
+    check(subnormal.double_value("--ratio", 0.0) > 0.0,
+          "subnormal CLI ratio still parses as positive");
+
+    // An absent option still falls back instead of being parsed as empty.
+    const auto absent = make_arguments({"leann", "bench"});
+    check(absent.double_value("--ratio", 0.25) == 0.25,
+          "absent decimal option returns its fallback");
 }
 
 // Builds a small artifact pair with the hash embedder so the CLI commands can
