@@ -1,0 +1,40 @@
+# Conventions from CONTRIBUTING.md, applied by the editor.
+# https://editorconfig.org
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# C++20, 4-space indent, 80-column wrapping.
+[*.{c,h,cpp,hpp}]
+indent_style = space
+indent_size = 4
+max_line_length = 80
+
+[*.py]
+indent_style = space
+indent_size = 4
+max_line_length = 79
+
+[*.{yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.{cmake,txt}]
+indent_style = space
+indent_size = 4
+
+[CMakeLists.txt]
+indent_style = space
+indent_size = 4
+
+# Tabs are syntactically significant in a makefile.
+[Makefile]
+indent_style = tab
+
+[*.md]
+trim_trailing_whitespace = false
