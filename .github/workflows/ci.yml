@@ -10,6 +10,14 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # Pin a deployment target below the runner's own OS version so a library
+      # API introduced in a very recent SDK cannot silently become a build
+      # requirement. std::from_chars for floating point is macOS 26 only, and
+      # the runner defaulting to its own version is what hid that. CMake
+      # initializes CMAKE_OSX_DEPLOYMENT_TARGET from this and clang reads it
+      # directly; Linux runners ignore it.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

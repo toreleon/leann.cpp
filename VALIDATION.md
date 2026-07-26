@@ -136,6 +136,21 @@ thread-safe.
 Validated on Apple arm64 with AppleClang 21:
 
 - C++20 Makefile build and unit test: pass.
+- macOS deployment-target floor: the whole tree, including
+  `tests/test_c_header.c` as strict C11, builds and all six suites pass under
+  `-mmacosx-version-min=13.0` with `-Wall -Wextra -Wpedantic -Werror`: pass.
+  Before the CLI decimal parser was rewritten, compiling `app/main.cpp` alone
+  at the same deployment target failed with exactly one error,
+  `app/main.cpp:175:40: error: 'from_chars' is unavailable: introduced in
+  macOS 26.0`. Only the macOS floor was measured; no GCC or Linux distribution
+  floor was tested.
+- CLI text-output equivalence across the decimal-parser rewrite: 287 lines of
+  `--help`, `--version`, 16 rejected `--hub-ratio`/`--rerank-ratio` spellings,
+  and build/stats/search round trips compared between binaries built from the
+  parent commit and the rewrite; stdout, stderr, and exit codes byte-identical
+  once wall-clock timing fields are normalized. Five equivalent spellings of
+  the same ratio (`0.02`, `2e-2`, `.02`, `0.020000`, `2E-2`) each produced a
+  1516-byte index: pass.
 - CMake Release build: pass.
 - CMake install to a temporary prefix: pass.
 - ASan + UBSan test with `halt_on_error=1`: pass.

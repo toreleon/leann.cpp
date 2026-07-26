@@ -71,6 +71,13 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
+The sources use `std::bit_cast`, `std::span`, and `std::ranges`, so the floor is
+a C++20 standard library that provides them: libstdc++ 11 (GCC 11) or libc++ 14.
+No minimum macOS deployment target is imposed, and CI pins the macOS job to
+`MACOSX_DEPLOYMENT_TARGET=13.0` so nothing in the tree can start depending on a
+library API from a newer SDK. CI exercises `ubuntu-latest` and `macos-latest`
+only; other platforms are unmeasured.
+
 Enable the native llama.cpp backend with an existing checkout:
 
 ```bash

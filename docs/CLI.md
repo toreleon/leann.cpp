@@ -31,6 +31,12 @@ three results and exit status 0, which is indistinguishable from a correct
 answer to the question that was asked. Stray positional arguments and options
 missing their value are rejected the same way.
 
+Numeric option values are parsed strictly and without locale influence. A
+decimal option accepts an optional `-`, digits with an optional `.`, and an
+optional `e`/`E` exponent; a leading `+`, surrounding whitespace, a hex float,
+`inf`, and `nan` are all rejected with `must be a finite number`. An unsigned
+option accepts digits only. Neither ever silently truncates a value.
+
 `tests/test_cli_cache.cpp` pins the tables: every flag must be unique within a
 command, must start with `--`, and must carry help text.
 
